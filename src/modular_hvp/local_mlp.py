@@ -49,6 +49,8 @@ class RuntimeState:
     loss_patch: LossPatch | None = None
     records: list[ForwardRecord] = field(default_factory=list)
     loss_curvature: tuple[str, float] | None = None
+    loss_gradient: torch.Tensor | None = None
+    primal_loss: torch.Tensor | None = None
     backward_called: bool = False
     output_id: int | None = None
 
@@ -83,6 +85,7 @@ class LocalMLPHVPRuntime:
         self._tangents_by_parameter = {
             block.parameter: block.tangent for block in self.parameter_blocks
         }
+        self._parameter_use_counts = _parameter_use_counts(model)
         self._state = RuntimeState()
 
     def __enter__(self) -> "LocalMLPHVPRuntime":
@@ -113,6 +116,8 @@ class LocalMLPHVPRuntime:
                 delattr(module, self._ACTIVE_ATTR)
         self._state.records.clear()
         self._state.loss_curvature = None
+        self._state.loss_gradient = None
+        self._state.primal_loss = None
         self._state.output_id = None
         return None
 
@@ -142,6 +147,8 @@ class LocalMLPHVPRuntime:
                 "modular_hvp currently supports mse_loss reductions 'mean' and 'sum'"
             )
         self._state.loss_curvature = ("scaled_identity", coefficient)
+        self._state.loss_gradient = (coefficient * (input_primal - target_primal)).detach()
+        self._state.primal_loss = primal_loss
         primal_loss.register_hook(self._make_loss_hook())
         return primal_loss
 
@@ -300,6 +307,9 @@ class LocalMLPHVPRuntime:
                 "currently use torch.nn.MSELoss or torch.nn.functional.mse_loss"
             )
         _, coefficient = loss_curvature
+        if any(count > 1 for count in self._parameter_use_counts.values()):
+            self._compute_reused_parameter_hvps_autodiff()
+            return
 
         def curvature_apply(vector: torch.Tensor) -> torch.Tensor:
             return coefficient * vector
@@ -336,7 +346,8 @@ class LocalMLPHVPRuntime:
                         hvp = curved_dual.sum(dim=0)
                     else:
                         raise RuntimeError("local dual activation belongs to wrong module")
-                    hvps[parameter] = hvp
+                    existing_hvp = hvps.get(parameter)
+                    hvps[parameter] = hvp if existing_hvp is None else existing_hvp + hvp
 
                 previous_curvature_apply = curvature_apply
                 weight = record.module.weight.detach()
@@ -369,12 +380,38 @@ class LocalMLPHVPRuntime:
 
         return loss_hook
 
+    def _compute_reused_parameter_hvps_autodiff(self) -> None:
+        primal_loss = self._state.primal_loss
+        if primal_loss is None:
+            raise RuntimeError("missing saved loss for reused-parameter HVP")
+
+        with torch.enable_grad():
+            for block in self.parameter_blocks:
+                gradient = torch.autograd.grad(
+                    primal_loss,
+                    [block.parameter],
+                    create_graph=True,
+                    retain_graph=True,
+                    materialize_grads=True,
+                )[0]
+                directional_gradient = (gradient * block.tangent).sum()
+                hvp = torch.autograd.grad(
+                    directional_gradient,
+                    [block.parameter],
+                    retain_graph=True,
+                    materialize_grads=True,
+                )[0]
+                setattr(block.parameter, "hvp", hvp.detach())
+
 
 def _is_supported_mlp(model: nn.Module) -> bool:
     if isinstance(model, nn.Linear):
         return True
     if isinstance(model, nn.Sequential):
-        return all(isinstance(module, (nn.Linear, nn.ReLU)) for module in model.children())
+        return all(
+            isinstance(module, (nn.Linear, nn.ReLU))
+            for module in model._modules.values()
+        )
     return False
 
 
@@ -382,8 +419,19 @@ def _iter_supported_modules(model: nn.Module) -> tuple[nn.Module, ...]:
     if isinstance(model, nn.Linear):
         return (model,)
     if isinstance(model, nn.Sequential):
-        return tuple(model.children())
+        return tuple(model._modules.values())
     raise TypeError("unsupported model type")
+
+
+def _parameter_use_counts(model: nn.Module) -> dict[nn.Parameter, int]:
+    counts: dict[nn.Parameter, int] = {}
+    for module in _iter_supported_modules(model):
+        if not isinstance(module, nn.Linear):
+            continue
+        counts[module.weight] = counts.get(module.weight, 0) + 1
+        if module.bias is not None:
+            counts[module.bias] = counts.get(module.bias, 0) + 1
+    return counts
 
 
 def _primal(value: Any) -> Any:

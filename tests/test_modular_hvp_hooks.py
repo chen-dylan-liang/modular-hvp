@@ -145,6 +145,33 @@ def test_default_modular_hvp_matches_block_autodiff_on_mlp() -> None:
         assert torch.allclose(parameter.hvp, reference_hvps[name], rtol=1e-10, atol=1e-10)
 
 
+def test_default_modular_hvp_accumulates_reused_parameter_hvps() -> None:
+    torch.manual_seed(1)
+
+    def make_model() -> nn.Sequential:
+        shared = nn.Linear(3, 3).double()
+        return nn.Sequential(shared, nn.ReLU(), shared)
+
+    baseline = make_model()
+    model = make_model()
+    model.load_state_dict(baseline.state_dict())
+
+    x = torch.randn(4, 3, dtype=torch.float64)
+    target = torch.randn(4, 3, dtype=torch.float64)
+    criterion = nn.MSELoss()
+    tangents = {
+        name: torch.randn_like(parameter)
+        for name, parameter in model.named_parameters()
+    }
+    reference_hvps = _block_autodiff_hvps(baseline, criterion, x, target, tangents)
+
+    with modular_hvp(model, tangents):
+        criterion(model(x), target).backward()
+
+    for name, parameter in model.named_parameters():
+        assert torch.allclose(parameter.hvp, reference_hvps[name], rtol=1e-10, atol=1e-10)
+
+
 def test_explicit_hook_backend_preserves_primal_forward_and_gradients() -> None:
     torch.manual_seed(0)
     baseline = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2))

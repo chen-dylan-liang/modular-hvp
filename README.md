@@ -86,10 +86,11 @@ The current `modular_hvp` implementation is correct on these MLP benchmarks,
 and follows the per-parameter locality rules: each parameter tangent is consumed
 inside its owning Linear forward, the normal model receives only the primal
 activation, and the saved local dual activation is consumed later to write the
-single public `p.hvp`. This first local runtime is still scoped to
-Linear/ReLU/MSE and uses explicit local backward primitives for that scope; the
-next step is to route more of that backward dualization through the generic
-primitive operator backend.
+single public `p.hvp`. Reused parameters accumulate into that same `p.hvp`; the
+current shared-parameter path uses a correctness fallback. This first local
+runtime is still scoped to Linear/ReLU/MSE and uses explicit local backward
+primitives for that scope; the next step is to route more of that backward
+dualization through the generic primitive operator backend.
 
 | Setting | Method | Max abs error | Max rel error | Mean time | Median RSS delta | Max RSS delta |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
