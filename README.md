@@ -72,11 +72,15 @@ Recorded CPU runs:
 
 Latest local results:
 
+For `backpack_hmp`, BackPACK's `extend(...)` setup is performed before the
+timed region. The measured region contains the forward pass, BackPACK HMP
+backward pass, and one `param.hmp(...)` application per parameter.
+
 | Setting | Method | Max abs error | Max rel error | Mean time | Median RSS delta | Max RSS delta |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| MNIST preset | `modular_dual` | 0.000e+00 | 0.000e+00 | 14.075 ms | 40.00 KiB | 92.00 KiB |
-| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 29.447 ms | 5.46 MiB | 5.56 MiB |
-| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 14.306 ms | 1.21 MiB | 1.32 MiB |
-| Larger stress | `modular_dual` | 0.000e+00 | 0.000e+00 | 52.223 ms | 120.00 KiB | 264.00 KiB |
-| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 80.536 ms | 28.17 MiB | 28.19 MiB |
-| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 80.883 ms | 11.59 MiB | 11.61 MiB |
+| MNIST preset | `modular_dual` | 0.000e+00 | 0.000e+00 | 13.904 ms | 54.00 KiB | 176.00 KiB |
+| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 24.726 ms | 5.44 MiB | 5.48 MiB |
+| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 14.489 ms | 1.21 MiB | 1.31 MiB |
+| Larger stress | `modular_dual` | 0.000e+00 | 0.000e+00 | 56.059 ms | 152.00 KiB | 232.00 KiB |
+| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 74.157 ms | 28.20 MiB | 28.25 MiB |
+| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 76.694 ms | 11.59 MiB | 11.59 MiB |

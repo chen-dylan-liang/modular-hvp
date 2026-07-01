@@ -57,6 +57,17 @@ BlockHVPFn = Callable[
     [nn.Module, nn.Module, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]],
     dict[str, torch.Tensor],
 ]
+ProblemFactory = Callable[
+    [ToyMLPConfig],
+    tuple[nn.Module, nn.Module, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]],
+]
+
+
+@dataclass(frozen=True)
+class MethodSpec:
+    name: str
+    fn: BlockHVPFn
+    make_problem: ProblemFactory
 
 
 def make_toy_mlp(config: ToyMLPConfig) -> nn.Sequential:
@@ -267,20 +278,51 @@ def backpack_hmp_block_hvp(
 ) -> dict[str, torch.Tensor]:
     """Compute block HVPs with BackPACK's HMP extension."""
 
-    from backpack import backpack, extend
-    from backpack.extensions import HMP
+    from backpack import extend
 
     config = _config_from_model_and_data(model, x, target)
     bp_model = extend(make_toy_mlp(config))
     bp_model.load_state_dict(model.state_dict())
     bp_loss_fn = extend(type(loss_fn)(reduction=loss_fn.reduction))
 
-    loss = bp_loss_fn(bp_model(x), target)
+    return _backpack_hmp_prepared_block_hvp(bp_model, bp_loss_fn, x, target, vectors)
+
+
+def _make_backpack_hmp_problem(
+    config: ToyMLPConfig,
+) -> tuple[nn.Module, nn.Module, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Create a problem with BackPACK extension outside timed benchmark scope."""
+
+    from backpack import extend
+
+    model, loss_fn, x, target, vectors = make_problem(config)
+    return (
+        extend(model),
+        extend(type(loss_fn)(reduction=loss_fn.reduction)),
+        x,
+        target,
+        vectors,
+    )
+
+
+def _backpack_hmp_prepared_block_hvp(
+    model: nn.Module,
+    loss_fn: nn.Module,
+    x: torch.Tensor,
+    target: torch.Tensor,
+    vectors: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Compute HMP block HVPs on a model/loss already prepared by BackPACK."""
+
+    from backpack import backpack
+    from backpack.extensions import HMP
+
+    loss = loss_fn(model(x), target)
     with backpack(HMP()):
         loss.backward()
 
     hvps: dict[str, torch.Tensor] = {}
-    for name, param in bp_model.named_parameters():
+    for name, param in model.named_parameters():
         hvp = param.hmp(vectors[name].unsqueeze(0))[0].detach()
         setattr(param, "hvp", hvp)
         hvps[name] = hvp
@@ -329,6 +371,7 @@ def benchmark_method(
     method: BlockHVPFn,
     config: ToyMLPConfig,
     *,
+    problem_factory: ProblemFactory = make_problem,
     warmup: int,
     repeats: int,
     rss_sample_interval_s: float,
@@ -339,7 +382,7 @@ def benchmark_method(
     peak_cuda_allocs: list[int] = []
 
     for index in range(warmup + repeats):
-        model, loss_fn, x, target, vectors = make_problem(config)
+        model, loss_fn, x, target, vectors = problem_factory(config)
         if config.device.startswith("cuda"):
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
@@ -437,11 +480,23 @@ def _dtype(name: str) -> torch.dtype:
     raise ValueError(f"unsupported dtype: {name!r}")
 
 
-def _methods() -> dict[str, BlockHVPFn]:
+def _methods() -> dict[str, MethodSpec]:
     return {
-        "modular_dual": modular_dual_block_hvp,
-        "backpack_hmp": backpack_hmp_block_hvp,
-        "backpack_autodiff": backpack_autodiff_block_hvp,
+        "modular_dual": MethodSpec(
+            "modular_dual",
+            modular_dual_block_hvp,
+            make_problem,
+        ),
+        "backpack_hmp": MethodSpec(
+            "backpack_hmp",
+            _backpack_hmp_prepared_block_hvp,
+            _make_backpack_hmp_problem,
+        ),
+        "backpack_autodiff": MethodSpec(
+            "backpack_autodiff",
+            backpack_autodiff_block_hvp,
+            make_problem,
+        ),
     }
 
 
@@ -548,25 +603,27 @@ def main() -> None:
     )
 
     methods = _methods()
-    model, loss_fn, x, target, vectors = make_problem(config)
-    reference = methods["modular_dual"](model, loss_fn, x, target, vectors)
+    reference_spec = methods["modular_dual"]
+    model, loss_fn, x, target, vectors = reference_spec.make_problem(config)
+    reference = reference_spec.fn(model, loss_fn, x, target, vectors)
 
     comparisons: dict[str, dict[str, float]] = {}
-    for name, method in methods.items():
-        model, loss_fn, x, target, vectors = make_problem(config)
-        candidate = method(model, loss_fn, x, target, vectors)
+    for name, spec in methods.items():
+        model, loss_fn, x, target, vectors = spec.make_problem(config)
+        candidate = spec.fn(model, loss_fn, x, target, vectors)
         comparisons[name] = compare_results(reference, candidate)
 
     stats = [
         benchmark_method(
-            name,
-            method,
+            spec.name,
+            spec.fn,
             config,
+            problem_factory=spec.make_problem,
             warmup=args.warmup,
             repeats=args.repeats,
             rss_sample_interval_s=args.rss_sample_interval_ms / 1000,
         )
-        for name, method in methods.items()
+        for spec in methods.values()
     ]
 
     if args.json:
