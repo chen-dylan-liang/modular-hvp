@@ -238,8 +238,12 @@ def _make_rule_output(
     tangent_output: torch.Tensor,
 ) -> DualTensor:
     if tangent_output.shape != primal_output.shape:
-        tangent_output = tangent_output + torch.zeros_like(primal_output)
+        tangent_output = torch.broadcast_to(tangent_output, primal_output.shape)
     return make_dual(primal_output, tangent_output)
+
+
+def _zero_scalar_like(value: torch.Tensor) -> torch.Tensor:
+    return value.new_zeros(())
 
 
 def _apply_same_unary_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
@@ -457,7 +461,7 @@ def _relu_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Dual
     value = args[0]
     value_p, value_t, _ = _split(value)
     primal_output = func(value_p, **kwargs)
-    tangent_output = torch.where(value_p > 0, value_t, torch.zeros_like(value_t))
+    tangent_output = torch.where(value_p > 0, value_t, _zero_scalar_like(value_t))
     return _make_rule_output(primal_output, tangent_output)
 
 
@@ -490,7 +494,7 @@ def _threshold_backward_rule(
     input_p = primal(input_value)
     primal_output = func(grad_p, input_p, threshold, **kwargs)
     tangent_output = (
-        torch.where(input_p > threshold, grad_t, torch.zeros_like(grad_t))
+        torch.where(input_p > threshold, grad_t, _zero_scalar_like(grad_t))
         if grad_is_dual
         else torch.zeros_like(primal_output)
     )
@@ -543,8 +547,8 @@ def _where_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any
     primal_output = func(condition_p, left_p, right_p, **kwargs)
     tangent_output = func(
         condition_p,
-        left_t if left_is_dual else _zero_like(left_p),
-        right_t if right_is_dual else _zero_like(right_p),
+        left_t if left_is_dual else _zero_scalar_like(primal_output),
+        right_t if right_is_dual else _zero_scalar_like(primal_output),
     )
     return _make_rule_output(primal_output, tangent_output)
 

@@ -48,6 +48,12 @@ against BackPACK HMP and BackPACK's reverse-over-reverse HVP utility:
 uv run python benchmarks/compare_toy_mlp.py
 ```
 
+For less noisy memory measurements, use the synthetic MNIST-shaped MLP preset:
+
+```bash
+uv run python benchmarks/compare_toy_mlp.py --preset mnist-mlp
+```
+
 The script reports max absolute/relative error against the ModularHVP
-DualTensor path plus wall-clock time, sampled RSS delta, Python allocation
-peak, and CUDA allocation peak when running on CUDA.
+DualTensor path plus wall-clock time, median/max sampled RSS delta, Python
+allocation peak, and CUDA allocation peak when running on CUDA.

@@ -26,7 +26,7 @@ import psutil
 import torch
 from torch import nn
 
-from modular_hvp import run_with_dual_parameter, tangent
+from modular_hvp import make_dual, run_with_dual_parameter, tangent
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,7 @@ class ToyMLPConfig:
     batch_size: int = 64
     d_in: int = 16
     d_hidden: int = 32
+    hidden_layers: int = 1
     d_out: int = 8
     dtype: str = "float64"
     device: str = "cpu"
@@ -46,6 +47,7 @@ class MethodStats:
     mean_time_s: float
     min_time_s: float
     max_time_s: float
+    median_peak_rss_delta_bytes: int
     peak_rss_delta_bytes: int
     peak_python_alloc_bytes: int
     peak_cuda_alloc_bytes: int | None
@@ -58,11 +60,17 @@ BlockHVPFn = Callable[
 
 
 def make_toy_mlp(config: ToyMLPConfig) -> nn.Sequential:
-    return nn.Sequential(
-        nn.Linear(config.d_in, config.d_hidden),
-        nn.ReLU(),
-        nn.Linear(config.d_hidden, config.d_out),
-    ).to(device=config.device, dtype=_dtype(config.dtype))
+    if config.hidden_layers < 1:
+        raise ValueError("hidden_layers must be at least 1")
+
+    layers: list[nn.Module] = []
+    in_features = config.d_in
+    for _ in range(config.hidden_layers):
+        layers.append(nn.Linear(in_features, config.d_hidden))
+        layers.append(nn.ReLU())
+        in_features = config.d_hidden
+    layers.append(nn.Linear(in_features, config.d_out))
+    return nn.Sequential(*layers).to(device=config.device, dtype=_dtype(config.dtype))
 
 
 def make_problem(
@@ -102,20 +110,152 @@ def modular_dual_block_hvp(
     for param in params.values():
         setattr(param, "hvp", None)
 
-    for name, param in params.items():
-        output_hat = run_with_dual_parameter(model, name, vectors[name], x)
-        loss_hat = loss_fn(output_hat, target)
-        hvp = torch.autograd.grad(
-            tangent(loss_hat),
-            param,
-            create_graph=False,
-            retain_graph=False,
-            materialize_grads=True,
-        )[0].detach()
-        setattr(param, "hvp", hvp)
-        hvps[name] = hvp
+    original_requires_grad = {
+        name: param.requires_grad for name, param in params.items()
+    }
+    try:
+        for param in params.values():
+            param.requires_grad_(False)
+
+        if isinstance(model, nn.Sequential):
+            hvps.update(
+                _modular_dual_sequential_mlp_block_hvp(
+                    model,
+                    loss_fn,
+                    x,
+                    target,
+                    vectors,
+                    params,
+                    original_requires_grad,
+                )
+            )
+        else:
+            hvps.update(
+                _modular_dual_full_forward_block_hvp(
+                    model,
+                    loss_fn,
+                    x,
+                    target,
+                    vectors,
+                    params,
+                    original_requires_grad,
+                )
+            )
+    finally:
+        for name, param in params.items():
+            param.requires_grad_(original_requires_grad[name])
 
     return hvps
+
+
+def _modular_dual_full_forward_block_hvp(
+    model: nn.Module,
+    loss_fn: nn.Module,
+    x: torch.Tensor,
+    target: torch.Tensor,
+    vectors: dict[str, torch.Tensor],
+    params: dict[str, torch.Tensor],
+    original_requires_grad: dict[str, bool],
+) -> dict[str, torch.Tensor]:
+    hvps: dict[str, torch.Tensor] = {}
+    for name, param in params.items():
+        if not original_requires_grad[name]:
+            continue
+        param.requires_grad_(True)
+        output_hat = run_with_dual_parameter(model, name, vectors[name], x)
+        hvp = _hvp_from_dual_output(loss_fn, output_hat, target, param)
+        param.requires_grad_(False)
+        setattr(param, "hvp", hvp)
+        hvps[name] = hvp
+    return hvps
+
+
+def _modular_dual_sequential_mlp_block_hvp(
+    model: nn.Sequential,
+    loss_fn: nn.Module,
+    x: torch.Tensor,
+    target: torch.Tensor,
+    vectors: dict[str, torch.Tensor],
+    params: dict[str, torch.Tensor],
+    original_requires_grad: dict[str, bool],
+) -> dict[str, torch.Tensor]:
+    module_entries = tuple(model._modules.items())
+    suffix_modules = tuple(model.children())
+    prefix_activation = x
+    hvps: dict[str, torch.Tensor] = {}
+
+    for module_index, (module_name, module) in enumerate(module_entries):
+        if not isinstance(module, nn.Linear):
+            with torch.no_grad():
+                prefix_activation = module(prefix_activation)
+            continue
+
+        for leaf_name in ("weight", "bias"):
+            param_name = f"{module_name}.{leaf_name}"
+            param = params.get(param_name)
+            if param is None or not original_requires_grad[param_name]:
+                continue
+
+            tangent_value = vectors[param_name]
+            param.requires_grad_(True)
+            output_hat = _run_sequential_suffix_with_dual_parameter(
+                model,
+                start_index=module_index,
+                suffix_modules=suffix_modules,
+                param_name=param_name,
+                tangent_value=tangent_value,
+                input_value=prefix_activation.detach(),
+            )
+            hvp = _hvp_from_dual_output(loss_fn, output_hat, target, param)
+            param.requires_grad_(False)
+            setattr(param, "hvp", hvp)
+            hvps[param_name] = hvp
+
+        with torch.no_grad():
+            prefix_activation = module(prefix_activation)
+
+    return hvps
+
+
+def _run_sequential_suffix_with_dual_parameter(
+    model: nn.Sequential,
+    *,
+    start_index: int,
+    suffix_modules: tuple[nn.Module, ...],
+    param_name: str,
+    tangent_value: torch.Tensor,
+    input_value: torch.Tensor,
+) -> torch.Tensor:
+    module_path, _, leaf_name = param_name.rpartition(".")
+    owner_module = model.get_submodule(module_path)
+    original = owner_module._parameters[leaf_name]
+    if original is None:
+        raise ValueError(f"parameter {param_name!r} is None")
+
+    owner_module._parameters[leaf_name] = make_dual(original, tangent_value)
+    try:
+        output = input_value
+        for suffix_module in suffix_modules[start_index:]:
+            output = suffix_module(output)
+        return output
+    finally:
+        owner_module._parameters[leaf_name] = original
+
+
+def _hvp_from_dual_output(
+    loss_fn: nn.Module,
+    output_hat: torch.Tensor,
+    target: torch.Tensor,
+    param: torch.Tensor,
+) -> torch.Tensor:
+    loss_hat = loss_fn(output_hat, target)
+    return torch.autograd.grad(
+        tangent(loss_hat),
+        param,
+        create_graph=False,
+        retain_graph=False,
+        materialize_grads=True,
+    )[0].detach()
 
 
 def backpack_hmp_block_hvp(
@@ -226,6 +366,7 @@ def benchmark_method(
         mean_time_s=statistics.mean(times),
         min_time_s=min(times),
         max_time_s=max(times),
+        median_peak_rss_delta_bytes=int(statistics.median(peak_rss_deltas)),
         peak_rss_delta_bytes=max(peak_rss_deltas),
         peak_python_alloc_bytes=max(peak_python_allocs),
         peak_cuda_alloc_bytes=max(peak_cuda_allocs) if peak_cuda_allocs else None,
@@ -271,15 +412,18 @@ def _config_from_model_and_data(
     x: torch.Tensor,
     target: torch.Tensor,
 ) -> ToyMLPConfig:
-    first_linear = model[0]
-    second_linear = model[2]
-    if not isinstance(first_linear, nn.Linear) or not isinstance(second_linear, nn.Linear):
-        raise TypeError("expected nn.Sequential(Linear, ReLU, Linear)")
+    linear_layers = [module for module in model if isinstance(module, nn.Linear)]
+    if len(linear_layers) < 2:
+        raise TypeError("expected an MLP with at least two Linear layers")
+    hidden_widths = [layer.out_features for layer in linear_layers[:-1]]
+    if len(set(hidden_widths)) != 1:
+        raise TypeError("benchmark model reconstruction expects uniform hidden width")
     return ToyMLPConfig(
         batch_size=x.shape[0],
-        d_in=first_linear.in_features,
-        d_hidden=first_linear.out_features,
-        d_out=second_linear.out_features,
+        d_in=linear_layers[0].in_features,
+        d_hidden=hidden_widths[0],
+        hidden_layers=len(linear_layers) - 1,
+        d_out=linear_layers[-1].out_features,
         dtype=str(x.dtype).removeprefix("torch."),
         device=str(x.device),
     )
@@ -327,7 +471,8 @@ def _print_results(
     print("\nBenchmark")
     header = (
         f"{'method':17s} {'mean ms':>10s} {'min ms':>10s} {'max ms':>10s} "
-        f"{'peak RSS delta':>16s} {'py alloc peak':>15s} {'cuda peak':>12s}"
+        f"{'med RSS delta':>16s} {'max RSS delta':>16s} "
+        f"{'py alloc peak':>15s} {'cuda peak':>12s}"
     )
     print(header)
     print("-" * len(header))
@@ -337,6 +482,7 @@ def _print_results(
             f"{item.mean_time_s * 1e3:10.3f} "
             f"{item.min_time_s * 1e3:10.3f} "
             f"{item.max_time_s * 1e3:10.3f} "
+            f"{_format_bytes(item.median_peak_rss_delta_bytes):>16s} "
             f"{_format_bytes(item.peak_rss_delta_bytes):>16s} "
             f"{_format_bytes(item.peak_python_alloc_bytes):>15s} "
             f"{_format_bytes(item.peak_cuda_alloc_bytes):>12s}"
@@ -345,12 +491,19 @@ def _print_results(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--preset",
+        choices=("toy", "mnist-mlp"),
+        default="toy",
+        help="Use toy dimensions or a synthetic MNIST-shaped MLP.",
+    )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--d-in", type=int, default=16)
-    parser.add_argument("--d-hidden", type=int, default=32)
-    parser.add_argument("--d-out", type=int, default=8)
-    parser.add_argument("--dtype", choices=("float32", "float64"), default="float64")
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--d-in", type=int, default=None)
+    parser.add_argument("--d-hidden", type=int, default=None)
+    parser.add_argument("--hidden-layers", type=int, default=None)
+    parser.add_argument("--d-out", type=int, default=None)
+    parser.add_argument("--dtype", choices=("float32", "float64"), default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
@@ -363,15 +516,34 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _preset_config(name: str) -> ToyMLPConfig:
+    if name == "toy":
+        return ToyMLPConfig()
+    if name == "mnist-mlp":
+        return ToyMLPConfig(
+            batch_size=256,
+            d_in=28 * 28,
+            d_hidden=256,
+            hidden_layers=3,
+            d_out=10,
+            dtype="float32",
+        )
+    raise ValueError(f"unknown preset: {name!r}")
+
+
 def main() -> None:
     args = parse_args()
+    preset = _preset_config(args.preset)
     config = ToyMLPConfig(
         seed=args.seed,
-        batch_size=args.batch_size,
-        d_in=args.d_in,
-        d_hidden=args.d_hidden,
-        d_out=args.d_out,
-        dtype=args.dtype,
+        batch_size=args.batch_size if args.batch_size is not None else preset.batch_size,
+        d_in=args.d_in if args.d_in is not None else preset.d_in,
+        d_hidden=args.d_hidden if args.d_hidden is not None else preset.d_hidden,
+        hidden_layers=(
+            args.hidden_layers if args.hidden_layers is not None else preset.hidden_layers
+        ),
+        d_out=args.d_out if args.d_out is not None else preset.d_out,
+        dtype=args.dtype if args.dtype is not None else preset.dtype,
         device=args.device,
     )
 
