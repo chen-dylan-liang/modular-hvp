@@ -186,17 +186,20 @@ def test_default_modular_hvp_uses_original_module_forward() -> None:
 
 def test_default_modular_hvp_passes_dual_parameters_to_forward() -> None:
     class InspectLinear(nn.Linear):
+        calls: int
         dual_weight_calls: int
         dual_bias_calls: int
         primal_calls: int
 
         def __init__(self, in_features: int, out_features: int) -> None:
             super().__init__(in_features, out_features)
+            self.calls = 0
             self.dual_weight_calls = 0
             self.dual_bias_calls = 0
             self.primal_calls = 0
 
         def forward(self, input: torch.Tensor) -> torch.Tensor:
+            self.calls += 1
             weight_is_dual = is_dual(self.weight)
             bias_is_dual = is_dual(self.bias)
             self.dual_weight_calls += int(weight_is_dual)
@@ -218,9 +221,10 @@ def test_default_modular_hvp_passes_dual_parameters_to_forward() -> None:
         criterion(model(x), target).backward()
 
     layer = model[0]
+    assert layer.calls == 1
     assert layer.dual_weight_calls == 1
     assert layer.dual_bias_calls == 1
-    assert layer.primal_calls == 1
+    assert layer.primal_calls == 0
     for parameter in model.parameters():
         assert parameter.hvp is not None
 

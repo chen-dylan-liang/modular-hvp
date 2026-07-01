@@ -10,7 +10,15 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from modular_hvp.dual import _make_zero_dual, make_dual, tangent
+from modular_hvp.dual import (
+    _extract_tangent,
+    _make_multi_dual,
+    _make_zero_dual,
+    _tangent_eval_only,
+    make_dual,
+    primal,
+    tangent,
+)
 from modular_hvp.runtime import ParameterBlock, _resolve_parameter_blocks
 
 
@@ -261,29 +269,40 @@ class LocalMLPHVPRuntime:
     ) -> torch.Tensor:
         input_primal = input_value.detach()
         local_duals: dict[nn.Parameter, torch.Tensor] = {}
+        dual_parameters: dict[str, torch.Tensor] = {}
 
         weight_tangent = self._tangents_by_parameter.get(module.weight)
         if weight_tangent is not None:
-            output_hat = self._run_module_with_dual_parameter(
-                module,
-                "weight",
-                make_dual(module.weight.detach(), weight_tangent.detach()),
-                input_primal,
+            dual_parameters["weight"] = _make_multi_dual(
+                module.weight,
+                {module.weight: weight_tangent.detach()},
             )
-            local_duals[module.weight] = tangent(output_hat).detach()
 
         if module.bias is not None:
             bias_tangent = self._tangents_by_parameter.get(module.bias)
             if bias_tangent is not None:
-                output_hat = self._run_module_with_dual_parameter(
-                    module,
-                    "bias",
-                    make_dual(module.bias.detach(), bias_tangent.detach()),
-                    input_primal,
+                dual_parameters["bias"] = _make_multi_dual(
+                    module.bias,
+                    {module.bias: bias_tangent.detach()},
                 )
-                local_duals[module.bias] = tangent(output_hat).detach()
 
-        output = self._call_module_forward(module, input_value)
+        if dual_parameters:
+            output_hat = self._run_module_with_dual_parameters(
+                module,
+                dual_parameters,
+                input_value,
+            )
+            output = primal(output_hat)
+            tangent_payload = tangent(output_hat)
+            for parameter in self._active_module_parameters(module):
+                if parameter in self._tangents_by_parameter:
+                    local_duals[parameter] = _extract_tangent(
+                        tangent_payload,
+                        parameter,
+                    ).detach()
+        else:
+            output = self._call_module_forward(module, input_value)
+
         self._state.records.append(
             LinearForwardRecord(
                 module=module,
@@ -316,22 +335,33 @@ class LocalMLPHVPRuntime:
             return patch.original_forward(*args, **kwargs)
         return module.forward(*args, **kwargs)
 
-    def _run_module_with_dual_parameter(
+    def _run_module_with_dual_parameters(
         self,
         module: nn.Module,
-        parameter_name: str,
-        dual_parameter: torch.Tensor,
+        dual_parameters: Mapping[str, torch.Tensor],
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        original_parameter = module._parameters[parameter_name]
-        if original_parameter is None:
-            raise RuntimeError(f"parameter {parameter_name!r} is None")
-        module._parameters[parameter_name] = dual_parameter
+        original_parameters: dict[str, torch.Tensor | None] = {}
+        for parameter_name, dual_parameter in dual_parameters.items():
+            original_parameter = module._parameters[parameter_name]
+            if original_parameter is None:
+                raise RuntimeError(f"parameter {parameter_name!r} is None")
+            original_parameters[parameter_name] = original_parameter
+            module._parameters[parameter_name] = dual_parameter
         try:
             return self._call_module_forward(module, *args, **kwargs)
         finally:
-            module._parameters[parameter_name] = original_parameter
+            for parameter_name, original_parameter in original_parameters.items():
+                module._parameters[parameter_name] = original_parameter
+
+    def _active_module_parameters(self, module: nn.Module) -> tuple[nn.Parameter, ...]:
+        parameters: list[nn.Parameter] = []
+        if isinstance(module, nn.Linear):
+            parameters.append(module.weight)
+            if module.bias is not None:
+                parameters.append(module.bias)
+        return tuple(parameters)
 
     def _compute_hvps(self) -> None:
         loss_record = self._state.loss_record
@@ -365,74 +395,79 @@ class LocalMLPHVPRuntime:
 
         hvps: dict[nn.Parameter, torch.Tensor] = {}
         with torch.no_grad():
-            for record in reversed(self._state.records):
-                if isinstance(record, ReLUForwardRecord):
-                    previous_curvature_apply = curvature_apply
-                    input_primal = record.input_primal
+            with _tangent_eval_only():
+                for record in reversed(self._state.records):
+                    if isinstance(record, ReLUForwardRecord):
+                        previous_curvature_apply = curvature_apply
+                        input_primal = record.input_primal
 
-                    def relu_curvature_apply(
+                        def relu_curvature_apply(
+                            vector: torch.Tensor,
+                            *,
+                            input_primal: torch.Tensor = input_primal,
+                            previous_curvature_apply: Any = previous_curvature_apply,
+                        ) -> torch.Tensor:
+                            output_tangent = tangent(
+                                torch.ops.aten.relu.default(
+                                    make_dual(input_primal, vector)
+                                )
+                            )
+                            output_curvature = previous_curvature_apply(output_tangent)
+                            input_curvature_hat = _relu_backward_program(
+                                input_primal,
+                                _make_zero_dual(output_curvature),
+                            )
+                            return tangent(input_curvature_hat)
+
+                        curvature_apply = relu_curvature_apply
+                        continue
+
+                    input_primal = record.input_primal
+                    for parameter, local_dual in record.local_dual_activations.items():
+                        curved_dual = curvature_apply(local_dual)
+                        grad_output_hat = _make_zero_dual(curved_dual)
+                        _, grad_weight_hat, grad_bias_hat = _linear_backward_program(
+                            input_primal,
+                            record.module.weight.detach(),
+                            grad_output_hat,
+                        )
+                        if parameter is record.module.weight:
+                            hvp = tangent(grad_weight_hat)
+                        elif parameter is record.module.bias:
+                            hvp = tangent(grad_bias_hat)
+                        else:
+                            raise RuntimeError(
+                                "local dual activation belongs to wrong module"
+                            )
+                        existing_hvp = hvps.get(parameter)
+                        hvps[parameter] = (
+                            hvp if existing_hvp is None else existing_hvp + hvp
+                        )
+
+                    previous_curvature_apply = curvature_apply
+                    weight = record.module.weight.detach()
+
+                    def linear_curvature_apply(
                         vector: torch.Tensor,
                         *,
-                        input_primal: torch.Tensor = input_primal,
+                        weight: torch.Tensor = weight,
                         previous_curvature_apply: Any = previous_curvature_apply,
                     ) -> torch.Tensor:
                         output_tangent = tangent(
-                            torch.ops.aten.relu.default(
-                                make_dual(input_primal, vector)
+                            _linear_forward_program(
+                                _make_zero_dual(vector),
+                                weight,
+                                None,
                             )
                         )
                         output_curvature = previous_curvature_apply(output_tangent)
-                        input_curvature_hat = _relu_backward_program(
-                            input_primal,
+                        input_curvature_hat = _linear_input_backward_program(
+                            weight,
                             _make_zero_dual(output_curvature),
                         )
                         return tangent(input_curvature_hat)
 
-                    curvature_apply = relu_curvature_apply
-                    continue
-
-                input_primal = record.input_primal
-                for parameter, local_dual in record.local_dual_activations.items():
-                    curved_dual = curvature_apply(local_dual)
-                    grad_output_hat = _make_zero_dual(curved_dual)
-                    _, grad_weight_hat, grad_bias_hat = _linear_backward_program(
-                        input_primal,
-                        record.module.weight.detach(),
-                        grad_output_hat,
-                    )
-                    if parameter is record.module.weight:
-                        hvp = tangent(grad_weight_hat)
-                    elif parameter is record.module.bias:
-                        hvp = tangent(grad_bias_hat)
-                    else:
-                        raise RuntimeError("local dual activation belongs to wrong module")
-                    existing_hvp = hvps.get(parameter)
-                    hvps[parameter] = hvp if existing_hvp is None else existing_hvp + hvp
-
-                previous_curvature_apply = curvature_apply
-                weight = record.module.weight.detach()
-
-                def linear_curvature_apply(
-                    vector: torch.Tensor,
-                    *,
-                    weight: torch.Tensor = weight,
-                    previous_curvature_apply: Any = previous_curvature_apply,
-                ) -> torch.Tensor:
-                    output_tangent = tangent(
-                        _linear_forward_program(
-                            _make_zero_dual(vector),
-                            weight,
-                            None,
-                        )
-                    )
-                    output_curvature = previous_curvature_apply(output_tangent)
-                    input_curvature_hat = _linear_input_backward_program(
-                        weight,
-                        _make_zero_dual(output_curvature),
-                    )
-                    return tangent(input_curvature_hat)
-
-                curvature_apply = linear_curvature_apply
+                    curvature_apply = linear_curvature_apply
 
             for block in self.parameter_blocks:
                 hvp = hvps.get(block.parameter)

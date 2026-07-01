@@ -25,10 +25,12 @@ Current implementation status:
 - The primitive `DualTensor` backend implements the operator-overloading layer
   used by lower-level forward-mode tests and by the current local backward
   tensor programs.
-- The runtime keeps the public forward path as ordinary PyTorch execution. It
-  calls each module's original `forward`; local dual activations are generated
-  by temporarily replacing exactly one owning parameter with a `DualTensor` and
-  calling the same `forward` under the primitive backend.
+- The runtime keeps the public forward path ordinary at module boundaries. When
+  a module owns active parameter blocks, the runtime calls that module's
+  original `forward` once with those parameters temporarily replaced by
+  block-keyed `DualTensor`s. Primitive rules produce both the primal output and
+  per-parameter local dual activations; only the primal output is passed to the
+  next module.
 - The generic hook-plumbing runtime remains available as an internal extension
   point for future optimized dualized-backward integration.
 
@@ -98,11 +100,13 @@ The local runtime does not stack independent parameter epsilons into a global or
 multi-channel tangent. Each saved local dual activation is consumed separately
 for its owning parameter block.
 
-The forward side does not reimplement module math. For both primal execution and
-local dual activation generation, the runtime calls the module's original
-`forward`; PyTorch then decomposes that code to ATen as usual, and the
-`DualTensor` backend only changes behavior when an ATen primitive receives a
-dual input.
+The forward side does not reimplement module math and does not replay once per
+parameter. For an active owning module, the runtime calls the module's original
+`forward` once with local `DualTensor` parameters. PyTorch decomposes that code
+to ATen as usual; the `DualTensor` backend only changes behavior when an ATen
+primitive receives a dual input. The resulting tangent payload is keyed by
+parameter, so `dy_weight` and `dy_bias` remain separate local epsilons instead
+of being summed into a global tangent.
 
 The current backward side is still the narrow MLP/MSE milestone, not the final
 general backward-hook runtime. Its tensor programs are expressed through ATen
@@ -116,11 +120,11 @@ primitives and run through the `DualTensor` registry:
 
 | Setting | Method | Max abs error | Max rel error | Mean time | Median RSS delta | Max RSS delta |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| MNIST preset | `modular_hvp` | 0.000e+00 | 0.000e+00 | 41.512 ms | 2.62 MiB | 2.70 MiB |
-| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 41.128 ms | 4.92 MiB | 4.96 MiB |
-| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 26.313 ms | 1.78 MiB | 1.84 MiB |
-| MNIST preset | `torch_backward` | n/a | n/a | 3.500 ms | 16.00 KiB | 16.00 KiB |
-| Larger stress | `modular_hvp` | 0.000e+00 | 0.000e+00 | 141.200 ms | 12.89 MiB | 13.04 MiB |
-| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 115.868 ms | 27.17 MiB | 27.19 MiB |
-| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 130.038 ms | 11.57 MiB | 11.57 MiB |
-| Larger stress | `torch_backward` | n/a | n/a | 11.966 ms | 16.00 KiB | 16.00 KiB |
+| MNIST preset | `modular_hvp` | 0.000e+00 | 0.000e+00 | 42.547 ms | 2.63 MiB | 2.67 MiB |
+| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 36.201 ms | 4.90 MiB | 4.98 MiB |
+| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 20.433 ms | 1.71 MiB | 1.84 MiB |
+| MNIST preset | `torch_backward` | n/a | n/a | 2.612 ms | 16.00 KiB | 16.00 KiB |
+| Larger stress | `modular_hvp` | 0.000e+00 | 0.000e+00 | 119.304 ms | 12.98 MiB | 14.43 MiB |
+| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 105.340 ms | 27.16 MiB | 27.17 MiB |
+| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 104.266 ms | 11.55 MiB | 11.58 MiB |
+| Larger stress | `torch_backward` | n/a | n/a | 11.776 ms | 16.00 KiB | 16.00 KiB |

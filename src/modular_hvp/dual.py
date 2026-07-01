@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from contextvars import ContextVar
+from contextlib import contextmanager
+from collections.abc import Callable, Mapping
 from numbers import Number
 from typing import Any
 
 import torch
 from torch import nn
+
+TangentPayload = torch.Tensor | dict[object, torch.Tensor]
+_OUTER_GRAD_ENABLED: ContextVar[bool | None] = ContextVar(
+    "_OUTER_GRAD_ENABLED",
+    default=None,
+)
+_IN_TANGENT_EVAL: ContextVar[bool] = ContextVar(
+    "_IN_TANGENT_EVAL",
+    default=False,
+)
 
 
 class DualTensor(torch.Tensor):
@@ -20,7 +32,7 @@ class DualTensor(torch.Tensor):
     def __new__(
         cls,
         primal: torch.Tensor | None,
-        tangent: torch.Tensor,
+        tangent: TangentPayload,
         *,
         primal_is_zero: bool = False,
     ) -> "DualTensor":
@@ -49,7 +61,7 @@ class DualTensor(torch.Tensor):
     ) -> None:
         if primal_is_zero:
             if not isinstance(tangent, torch.Tensor):
-                raise TypeError("tangent must be a torch.Tensor")
+                raise TypeError("zero-primal tangent must be a torch.Tensor")
             primal = None
         else:
             if primal is None:
@@ -71,11 +83,27 @@ class DualTensor(torch.Tensor):
             kwargs = {}
         if _has_out_argument(kwargs):
             raise NotImplementedError(f"DualTensor rule not implemented for {func}")
-        rule = _RULES.get(func)
-        if rule is not None:
-            return rule(func, args, kwargs)
-        with torch._C.DisableTorchFunctionSubclass():
-            return func(*args, **kwargs)
+        if not _IN_TANGENT_EVAL.get() and _tree_has_dual((args, kwargs)):
+            with torch._C.DisableTorchFunctionSubclass():
+                primal_output = func(*_tree_primal(args), **_tree_primal(kwargs))
+            tangent_token = _IN_TANGENT_EVAL.set(True)
+            grad_token = _OUTER_GRAD_ENABLED.set(torch.is_grad_enabled())
+            try:
+                tangent_output = func(*args, **kwargs)
+            finally:
+                _OUTER_GRAD_ENABLED.reset(grad_token)
+                _IN_TANGENT_EVAL.reset(tangent_token)
+            return _replace_primal(tangent_output, primal_output)
+
+        token = _OUTER_GRAD_ENABLED.set(torch.is_grad_enabled())
+        try:
+            rule = _RULES.get(func)
+            if rule is not None:
+                return rule(func, args, kwargs)
+            with torch._C.DisableTorchFunctionSubclass():
+                return func(*args, **kwargs)
+        finally:
+            _OUTER_GRAD_ENABLED.reset(token)
 
     @classmethod
     def __torch_dispatch__(
@@ -124,10 +152,30 @@ def make_dual(primal: torch.Tensor, tangent: torch.Tensor) -> DualTensor:
     return DualTensor(primal, tangent)
 
 
+def _make_multi_dual(
+    primal_value: torch.Tensor,
+    tangents: Mapping[object, torch.Tensor],
+) -> DualTensor:
+    if not isinstance(primal_value, torch.Tensor):
+        raise TypeError("primal must be a torch.Tensor")
+    if not tangents:
+        raise ValueError("multi-dual tangents must not be empty")
+    return DualTensor(primal_value, dict(tangents))
+
+
 def _make_zero_dual(tangent_value: torch.Tensor) -> DualTensor:
     if not isinstance(tangent_value, torch.Tensor):
         raise TypeError("tangent must be a torch.Tensor")
     return DualTensor(None, tangent_value, primal_is_zero=True)
+
+
+@contextmanager
+def _tangent_eval_only() -> Any:
+    token = _IN_TANGENT_EVAL.set(True)
+    try:
+        yield
+    finally:
+        _IN_TANGENT_EVAL.reset(token)
 
 
 def is_dual(x: object) -> bool:
@@ -184,7 +232,17 @@ Rule = Callable[[Any, tuple[Any, ...], dict[str, Any]], Any]
 _RULES: dict[Any, Rule] = {}
 
 
-def _validate_dual_parts(primal_value: torch.Tensor, tangent_value: torch.Tensor) -> None:
+def _validate_dual_parts(
+    primal_value: torch.Tensor,
+    tangent_value: TangentPayload,
+) -> None:
+    if _is_tangent_map(tangent_value):
+        for key, item in tangent_value.items():
+            try:
+                _validate_dual_parts(primal_value, item)
+            except ValueError as error:
+                raise ValueError(f"invalid tangent for block {key!r}: {error}") from error
+        return
     if primal_value.shape != tangent_value.shape:
         raise ValueError(
             f"dual tangent has shape {tuple(tangent_value.shape)}; "
@@ -231,8 +289,48 @@ def _tree_map(fn: Callable[[Any], Any], value: Any) -> Any:
     return value
 
 
+def _tree_has_dual(value: Any) -> bool:
+    if is_dual(value):
+        return True
+    if isinstance(value, tuple | list):
+        return any(_tree_has_dual(item) for item in value)
+    if isinstance(value, dict):
+        return any(_tree_has_dual(item) for item in value.values())
+    return False
+
+
 def _tree_primal(value: Any) -> Any:
     return _tree_map(primal, value)
+
+
+def _call_primal(func: Any, *args: Any, **kwargs: Any) -> Any:
+    grad_enabled = _OUTER_GRAD_ENABLED.get()
+    if grad_enabled is None:
+        grad_enabled = torch.is_grad_enabled()
+    with torch.set_grad_enabled(grad_enabled):
+        return func(*args, **kwargs)
+
+
+def _replace_primal(value: Any, primal_value: Any) -> Any:
+    if is_dual(value):
+        if not isinstance(primal_value, torch.Tensor):
+            return primal_value
+        return DualTensor(primal_value, value.tangent)
+    if isinstance(value, tuple):
+        return tuple(
+            _replace_primal(item, primal_item)
+            for item, primal_item in zip(value, primal_value, strict=True)
+        )
+    if isinstance(value, list):
+        return [
+            _replace_primal(item, primal_item)
+            for item, primal_item in zip(value, primal_value, strict=True)
+        ]
+    return primal_value
+
+
+def _is_tangent_map(value: Any) -> bool:
+    return isinstance(value, dict)
 
 
 def _split(value: Any) -> tuple[Any, Any, bool]:
@@ -259,8 +357,41 @@ def _add_terms(*terms: Any) -> Any:
         return None
     result = active_terms[0]
     for term in active_terms[1:]:
-        result = result + term
+        result = _add_tangent_payloads(result, term)
     return result
+
+
+def _add_tangent_payloads(left: Any, right: Any) -> Any:
+    if _is_tangent_map(left) or _is_tangent_map(right):
+        if not _is_tangent_map(left):
+            left = {key: torch.zeros_like(value) for key, value in right.items()}
+        if not _is_tangent_map(right):
+            right = {key: torch.zeros_like(value) for key, value in left.items()}
+        keys = left.keys() | right.keys()
+        output: dict[object, torch.Tensor] = {}
+        for key in keys:
+            if key in left and key in right:
+                output[key] = left[key] + right[key]
+            elif key in left:
+                output[key] = left[key]
+            else:
+                output[key] = right[key]
+        return output
+    return left + right
+
+
+def _map_tangent_payload(fn: Callable[[torch.Tensor], torch.Tensor], value: Any) -> Any:
+    if _is_tangent_map(value):
+        return {key: fn(item) for key, item in value.items()}
+    return fn(value)
+
+
+def _extract_tangent(value: Any, key: object) -> torch.Tensor:
+    if _is_tangent_map(value):
+        return value[key]
+    if isinstance(value, torch.Tensor):
+        return value
+    raise TypeError(f"cannot extract a tensor tangent from {type(value).__name__}")
 
 
 def _wrap(primal_output: Any, tangent_output: Any) -> Any:
@@ -271,8 +402,16 @@ def _wrap(primal_output: Any, tangent_output: Any) -> Any:
 
 def _make_rule_output(
     primal_output: torch.Tensor,
-    tangent_output: torch.Tensor,
+    tangent_output: Any,
 ) -> DualTensor:
+    if _is_tangent_map(tangent_output):
+        tangent_output = {
+            key: torch.broadcast_to(item, primal_output.shape)
+            if item.shape != primal_output.shape
+            else item
+            for key, item in tangent_output.items()
+        }
+        return _make_multi_dual(primal_output, tangent_output)
     if tangent_output.shape != primal_output.shape:
         tangent_output = torch.broadcast_to(tangent_output, primal_output.shape)
     return make_dual(primal_output, tangent_output)
@@ -291,13 +430,18 @@ def _apply_same_unary_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, A
         tangent_args = _tree_map(tangent, args)
         tangent_kwargs = _tree_map(tangent, kwargs)
         return _make_zero_rule_output(func(*tangent_args, **tangent_kwargs))
-    primal_args = _tree_primal(args)
+    value = args[0]
+    value_p, value_t, _ = _split(value)
+    other_args = args[1:]
     primal_kwargs = _tree_primal(kwargs)
-    tangent_args = _tree_map(tangent, args)
-    tangent_kwargs = _tree_map(tangent, kwargs)
+    primal_args = (value_p, *_tree_primal(other_args))
+    primal_kwargs = _tree_primal(kwargs)
     return _wrap(
-        func(*primal_args, **primal_kwargs),
-        func(*tangent_args, **tangent_kwargs),
+        _call_primal(func, *primal_args, **primal_kwargs),
+        _map_tangent_payload(
+            lambda item: func(item, *_tree_primal(other_args), **primal_kwargs),
+            value_t,
+        ),
     )
 
 
@@ -306,11 +450,13 @@ def _add_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualT
     alpha = kwargs.get("alpha", 1)
     left_p, left_t, left_is_dual = _split(left)
     right_p, right_t, right_is_dual = _split(right)
-    primal_output = func(left_p, right_p, **kwargs)
+    primal_output = _call_primal(func, left_p, right_p, **kwargs)
 
     tangent_output = _add_terms(
         left_t if left_is_dual else None,
-        alpha * right_t if right_is_dual else None,
+        _map_tangent_payload(lambda item: alpha * item, right_t)
+        if right_is_dual
+        else None,
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
@@ -322,11 +468,13 @@ def _sub_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualT
     alpha = kwargs.get("alpha", 1)
     left_p, left_t, left_is_dual = _split(left)
     right_p, right_t, right_is_dual = _split(right)
-    primal_output = func(left_p, right_p, **kwargs)
+    primal_output = _call_primal(func, left_p, right_p, **kwargs)
 
     tangent_output = _add_terms(
         left_t if left_is_dual else None,
-        -alpha * right_t if right_is_dual else None,
+        _map_tangent_payload(lambda item: -alpha * item, right_t)
+        if right_is_dual
+        else None,
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
@@ -337,10 +485,10 @@ def _rsub_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Dual
     right, left = args[:2]
     right_p, right_t, right_is_dual = _split(right)
     left_p, left_t, left_is_dual = _split(left)
-    primal_output = func(right_p, left_p, **kwargs)
+    primal_output = _call_primal(func, right_p, left_p, **kwargs)
     tangent_output = _add_terms(
         left_t if left_is_dual else None,
-        -right_t if right_is_dual else None,
+        _map_tangent_payload(lambda item: -item, right_t) if right_is_dual else None,
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
@@ -350,18 +498,25 @@ def _rsub_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Dual
 def _neg_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
     value = args[0]
     value_p, value_t, _ = _split(value)
-    return _make_rule_output(func(value_p, **kwargs), -value_t)
+    return _make_rule_output(
+        _call_primal(func, value_p, **kwargs),
+        _map_tangent_payload(lambda item: -item, value_t),
+    )
 
 
 def _mul_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
     left, right = args[:2]
     left_p, left_t, left_is_dual = _split(left)
     right_p, right_t, right_is_dual = _split(right)
-    primal_output = func(left_p, right_p, **kwargs)
+    primal_output = _call_primal(func, left_p, right_p, **kwargs)
 
     tangent_output = _add_terms(
-        left_t * right_p if left_is_dual else None,
-        left_p * right_t if right_is_dual else None,
+        _map_tangent_payload(lambda item: item * right_p, left_t)
+        if left_is_dual
+        else None,
+        _map_tangent_payload(lambda item: left_p * item, right_t)
+        if right_is_dual
+        else None,
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
@@ -372,11 +527,15 @@ def _div_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualT
     left, right = args[:2]
     left_p, left_t, left_is_dual = _split(left)
     right_p, right_t, right_is_dual = _split(right)
-    primal_output = func(left_p, right_p, **kwargs)
+    primal_output = _call_primal(func, left_p, right_p, **kwargs)
 
     tangent_output = _add_terms(
-        left_t / right_p if left_is_dual else None,
-        -(left_p * right_t) / (right_p * right_p) if right_is_dual else None,
+        _map_tangent_payload(lambda item: item / right_p, left_t)
+        if left_is_dual
+        else None,
+        _map_tangent_payload(lambda item: -(left_p * item) / (right_p * right_p), right_t)
+        if right_is_dual
+        else None,
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
@@ -387,10 +546,15 @@ def _rdiv_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Dual
     denominator, numerator = args[:2]
     denominator_p, denominator_t, denominator_is_dual = _split(denominator)
     numerator_p, numerator_t, numerator_is_dual = _split(numerator)
-    primal_output = func(denominator_p, numerator_p, **kwargs)
+    primal_output = _call_primal(func, denominator_p, numerator_p, **kwargs)
     tangent_output = _add_terms(
-        numerator_t / denominator_p if numerator_is_dual else None,
-        -(numerator_p * denominator_t) / (denominator_p * denominator_p)
+        _map_tangent_payload(lambda item: item / denominator_p, numerator_t)
+        if numerator_is_dual
+        else None,
+        _map_tangent_payload(
+            lambda item: -(numerator_p * item) / (denominator_p * denominator_p),
+            denominator_t,
+        )
         if denominator_is_dual
         else None,
     )
@@ -402,8 +566,11 @@ def _rdiv_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Dual
 def _reciprocal_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
     value = args[0]
     value_p, value_t, _ = _split(value)
-    primal_output = func(value_p, **kwargs)
-    tangent_output = -value_t / (value_p * value_p)
+    primal_output = _call_primal(func, value_p, **kwargs)
+    tangent_output = _map_tangent_payload(
+        lambda item: -item / (value_p * value_p),
+        value_t,
+    )
     return _make_rule_output(primal_output, tangent_output)
 
 
@@ -411,13 +578,21 @@ def _pow_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualT
     base, exponent = args[:2]
     base_p, base_t, base_is_dual = _split(base)
     exponent_p, exponent_t, exponent_is_dual = _split(exponent)
-    primal_output = func(base_p, exponent_p, **kwargs)
+    primal_output = _call_primal(func, base_p, exponent_p, **kwargs)
 
     tangent_output = _add_terms(
-        exponent_p * torch.pow(base_p, exponent_p - 1) * base_t
+        _map_tangent_payload(
+            lambda item: exponent_p * torch.pow(base_p, exponent_p - 1) * item,
+            base_t,
+        )
         if base_is_dual
         else None,
-        primal_output * torch.log(base_p) * exponent_t if exponent_is_dual else None,
+        _map_tangent_payload(
+            lambda item: primal_output * torch.log(base_p) * item,
+            exponent_t,
+        )
+        if exponent_is_dual
+        else None,
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
@@ -427,11 +602,14 @@ def _pow_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualT
 def _scalar_pow_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
     base, exponent = args[:2]
     exponent_p, exponent_t, exponent_is_dual = _split(exponent)
-    primal_output = func(base, exponent_p, **kwargs)
+    primal_output = _call_primal(func, base, exponent_p, **kwargs)
     if not exponent_is_dual:
         tangent_output = _zero_like(primal_output)
     else:
-        tangent_output = primal_output * math.log(base) * exponent_t
+        tangent_output = _map_tangent_payload(
+            lambda item: primal_output * math.log(base) * item,
+            exponent_t,
+        )
     return _make_rule_output(primal_output, tangent_output)
 
 
@@ -450,10 +628,14 @@ def _matmul_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Du
 
     left_p, left_t, left_is_dual = _split(left)
     right_p, right_t, right_is_dual = _split(right)
-    primal_output = func(left_p, right_p, **kwargs)
+    primal_output = _call_primal(func, left_p, right_p, **kwargs)
     tangent_output = _add_terms(
-        left_t @ right_p if left_is_dual else None,
-        left_p @ right_t if right_is_dual else None,
+        _map_tangent_payload(lambda item: item @ right_p, left_t)
+        if left_is_dual
+        else None,
+        _map_tangent_payload(lambda item: left_p @ item, right_t)
+        if right_is_dual
+        else None,
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
@@ -464,10 +646,14 @@ def _rmatmul_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> D
     right, left = args[:2]
     right_p, right_t, right_is_dual = _split(right)
     left_p, left_t, left_is_dual = _split(left)
-    primal_output = func(right_p, left_p, **kwargs)
+    primal_output = _call_primal(func, right_p, left_p, **kwargs)
     tangent_output = _add_terms(
-        left_t @ right_p if left_is_dual else None,
-        left_p @ right_t if right_is_dual else None,
+        _map_tangent_payload(lambda item: item @ right_p, left_t)
+        if left_is_dual
+        else None,
+        _map_tangent_payload(lambda item: left_p @ item, right_t)
+        if right_is_dual
+        else None,
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
@@ -481,11 +667,17 @@ def _addmm_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Dua
     input_p, input_t, input_is_dual = _split(input_value)
     mat1_p, mat1_t, mat1_is_dual = _split(mat1)
     mat2_p, mat2_t, mat2_is_dual = _split(mat2)
-    primal_output = func(input_p, mat1_p, mat2_p, **kwargs)
+    primal_output = _call_primal(func, input_p, mat1_p, mat2_p, **kwargs)
     tangent_output = _add_terms(
-        beta * input_t if input_is_dual else None,
-        alpha * (mat1_t @ mat2_p) if mat1_is_dual else None,
-        alpha * (mat1_p @ mat2_t) if mat2_is_dual else None,
+        _map_tangent_payload(lambda item: beta * item, input_t)
+        if input_is_dual
+        else None,
+        _map_tangent_payload(lambda item: alpha * (item @ mat2_p), mat1_t)
+        if mat1_is_dual
+        else None,
+        _map_tangent_payload(lambda item: alpha * (mat1_p @ item), mat2_t)
+        if mat2_is_dual
+        else None,
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
@@ -498,11 +690,15 @@ def _linear_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Du
     input_p, input_t, input_is_dual = _split(input_value)
     weight_p, weight_t, weight_is_dual = _split(weight)
     bias_p, bias_t, bias_is_dual = _split(bias)
-    primal_output = func(input_p, weight_p, bias_p, **kwargs)
+    primal_output = _call_primal(func, input_p, weight_p, bias_p, **kwargs)
 
     tangent_output = _add_terms(
-        input_t.matmul(weight_p.t()) if input_is_dual else None,
-        input_p.matmul(weight_t.t()) if weight_is_dual else None,
+        _map_tangent_payload(lambda item: item.matmul(weight_p.t()), input_t)
+        if input_is_dual
+        else None,
+        _map_tangent_payload(lambda item: input_p.matmul(item.t()), weight_t)
+        if weight_is_dual
+        else None,
         bias_t if bias_is_dual else None,
     )
     if tangent_output is None:
@@ -519,16 +715,22 @@ def _reduction_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) ->
     value_p, value_t, _ = _split(value)
     other_args = args[1:]
     return _make_rule_output(
-        func(value_p, *other_args, **kwargs),
-        func(value_t, *other_args, **kwargs),
+        _call_primal(func, value_p, *other_args, **kwargs),
+        _map_tangent_payload(
+            lambda item: func(item, *other_args, **kwargs),
+            value_t,
+        ),
     )
 
 
 def _relu_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
     value = args[0]
     value_p, value_t, _ = _split(value)
-    primal_output = func(value_p, **kwargs)
-    tangent_output = torch.where(value_p > 0, value_t, _zero_scalar_like(value_t))
+    primal_output = _call_primal(func, value_p, **kwargs)
+    tangent_output = _map_tangent_payload(
+        lambda item: torch.where(value_p > 0, item, _zero_scalar_like(item)),
+        value_t,
+    )
     return _make_rule_output(primal_output, tangent_output)
 
 
@@ -536,7 +738,7 @@ def _gelu_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Dual
     value = args[0]
     approximate = kwargs.get("approximate", "none")
     value_p, value_t, _ = _split(value)
-    primal_output = func(value_p, **kwargs)
+    primal_output = _call_primal(func, value_p, **kwargs)
 
     if approximate == "tanh":
         coeff = math.sqrt(2.0 / math.pi)
@@ -550,7 +752,10 @@ def _gelu_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Dual
         normal_pdf = torch.exp(-0.5 * value_p.pow(2)) / math.sqrt(2.0 * math.pi)
         derivative = normal_cdf + value_p * normal_pdf
 
-    return _make_rule_output(primal_output, derivative * value_t)
+    return _make_rule_output(
+        primal_output,
+        _map_tangent_payload(lambda item: derivative * item, value_t),
+    )
 
 
 def _threshold_backward_rule(
@@ -567,9 +772,12 @@ def _threshold_backward_rule(
         return _make_zero_rule_output(tangent_output)
 
     grad_p, grad_t, grad_is_dual = _split(grad_output)
-    primal_output = func(grad_p, input_p, threshold, **kwargs)
+    primal_output = _call_primal(func, grad_p, input_p, threshold, **kwargs)
     tangent_output = (
-        torch.where(input_p > threshold, grad_t, _zero_scalar_like(grad_t))
+        _map_tangent_payload(
+            lambda item: torch.where(input_p > threshold, item, _zero_scalar_like(item)),
+            grad_t,
+        )
         if grad_is_dual
         else torch.zeros_like(primal_output)
     )
@@ -582,26 +790,29 @@ def _mse_loss_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> 
     input_p, input_t, input_is_dual = _split(input_value)
     target_p, target_t, target_is_dual = _split(target)
     if len(args) > 2:
-        primal_output = func(input_p, target_p, reduction, **kwargs)
+        primal_output = _call_primal(func, input_p, target_p, reduction, **kwargs)
     else:
-        primal_output = func(input_p, target_p, **kwargs)
+        primal_output = _call_primal(func, input_p, target_p, **kwargs)
 
     diff = input_p - target_p
     diff_tangent = _add_terms(
         input_t if input_is_dual else None,
-        -target_t if target_is_dual else None,
+        _map_tangent_payload(lambda item: -item, target_t) if target_is_dual else None,
     )
     if diff_tangent is None:
         tangent_unreduced = torch.zeros_like(diff)
     else:
-        tangent_unreduced = 2 * diff * diff_tangent
+        tangent_unreduced = _map_tangent_payload(
+            lambda item: 2 * diff * item,
+            diff_tangent,
+        )
 
     if reduction in (0, "none"):
         tangent_output = tangent_unreduced
     elif reduction in (1, "mean"):
-        tangent_output = tangent_unreduced.mean()
+        tangent_output = _map_tangent_payload(lambda item: item.mean(), tangent_unreduced)
     elif reduction in (2, "sum"):
-        tangent_output = tangent_unreduced.sum()
+        tangent_output = _map_tangent_payload(lambda item: item.sum(), tangent_unreduced)
     else:
         raise ValueError(f"unknown mse_loss reduction: {reduction!r}")
     return _make_rule_output(primal_output, tangent_output)
@@ -616,12 +827,12 @@ def _mse_loss_backward_rule(
     grad_p, grad_t, grad_is_dual = _split(grad_output)
     input_p, input_t, input_is_dual = _split(input_value)
     target_p, target_t, target_is_dual = _split(target)
-    primal_output = func(grad_p, input_p, target_p, reduction, **kwargs)
+    primal_output = _call_primal(func, grad_p, input_p, target_p, reduction, **kwargs)
 
     diff = input_p - target_p
     diff_tangent = _add_terms(
         input_t if input_is_dual else None,
-        -target_t if target_is_dual else None,
+        _map_tangent_payload(lambda item: -item, target_t) if target_is_dual else None,
     )
     if reduction in (0, "none"):
         scale = 2.0
@@ -633,8 +844,12 @@ def _mse_loss_backward_rule(
         raise ValueError(f"unknown mse_loss reduction: {reduction!r}")
 
     tangent_output = _add_terms(
-        scale * grad_t * diff if grad_is_dual else None,
-        scale * grad_p * diff_tangent if diff_tangent is not None else None,
+        _map_tangent_payload(lambda item: scale * item * diff, grad_t)
+        if grad_is_dual
+        else None,
+        _map_tangent_payload(lambda item: scale * grad_p * item, diff_tangent)
+        if diff_tangent is not None
+        else None,
     )
     if tangent_output is None:
         tangent_output = torch.zeros_like(primal_output)
@@ -653,7 +868,7 @@ def _where_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any
     condition_p = primal(condition)
     left_p, left_t, left_is_dual = _split(left)
     right_p, right_t, right_is_dual = _split(right)
-    primal_output = func(condition_p, left_p, right_p, **kwargs)
+    primal_output = _call_primal(func, condition_p, left_p, right_p, **kwargs)
     tangent_output = func(
         condition_p,
         left_t if left_is_dual else _zero_scalar_like(primal_output),
