@@ -264,24 +264,26 @@ class LocalMLPHVPRuntime:
 
         weight_tangent = self._tangents_by_parameter.get(module.weight)
         if weight_tangent is not None:
-            output_hat = _linear_forward_program(
-                input_primal,
+            output_hat = self._run_module_with_dual_parameter(
+                module,
+                "weight",
                 make_dual(module.weight.detach(), weight_tangent.detach()),
-                module.bias.detach() if module.bias is not None else None,
+                input_primal,
             )
             local_duals[module.weight] = tangent(output_hat).detach()
 
         if module.bias is not None:
             bias_tangent = self._tangents_by_parameter.get(module.bias)
             if bias_tangent is not None:
-                output_hat = _linear_forward_program(
-                    input_primal,
-                    module.weight.detach(),
+                output_hat = self._run_module_with_dual_parameter(
+                    module,
+                    "bias",
                     make_dual(module.bias.detach(), bias_tangent.detach()),
+                    input_primal,
                 )
                 local_duals[module.bias] = tangent(output_hat).detach()
 
-        output = _linear_forward_program(input_value, module.weight, module.bias)
+        output = self._call_module_forward(module, input_value)
         self._state.records.append(
             LinearForwardRecord(
                 module=module,
@@ -299,9 +301,37 @@ class LocalMLPHVPRuntime:
         if module.inplace:
             raise NotImplementedError("LocalMLPHVPRuntime does not support inplace ReLU")
         input_primal = input_value.detach()
-        output = F.relu(input_value)
+        output = self._call_module_forward(module, input_value)
         self._state.records.append(ReLUForwardRecord(input_primal=input_primal))
         return output
+
+    def _call_module_forward(
+        self,
+        module: nn.Module,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        patch = self._state.forward_patch
+        if patch is not None and patch.module is module:
+            return patch.original_forward(*args, **kwargs)
+        return module.forward(*args, **kwargs)
+
+    def _run_module_with_dual_parameter(
+        self,
+        module: nn.Module,
+        parameter_name: str,
+        dual_parameter: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        original_parameter = module._parameters[parameter_name]
+        if original_parameter is None:
+            raise RuntimeError(f"parameter {parameter_name!r} is None")
+        module._parameters[parameter_name] = dual_parameter
+        try:
+            return self._call_module_forward(module, *args, **kwargs)
+        finally:
+            module._parameters[parameter_name] = original_parameter
 
     def _compute_hvps(self) -> None:
         loss_record = self._state.loss_record

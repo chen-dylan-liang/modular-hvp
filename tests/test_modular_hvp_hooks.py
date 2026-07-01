@@ -7,7 +7,7 @@ import pytest
 import torch
 from torch import nn
 
-from modular_hvp import FakeDualBackend, LocalDualActivations, modular_hvp
+from modular_hvp import FakeDualBackend, LocalDualActivations, is_dual, modular_hvp
 
 
 def _tangents_by_name(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -143,6 +143,86 @@ def test_default_modular_hvp_matches_block_autodiff_on_mlp() -> None:
         assert actual.hvp is not None
     for name, parameter in model.named_parameters():
         assert torch.allclose(parameter.hvp, reference_hvps[name], rtol=1e-10, atol=1e-10)
+
+
+def test_default_modular_hvp_uses_original_module_forward() -> None:
+    class OffsetLinear(nn.Linear):
+        def forward(self, input: torch.Tensor) -> torch.Tensor:
+            return super().forward(input) + 1.25
+
+    torch.manual_seed(0)
+    baseline = nn.Sequential(OffsetLinear(3, 4), nn.ReLU(), nn.Linear(4, 2)).double()
+    model = nn.Sequential(OffsetLinear(3, 4), nn.ReLU(), nn.Linear(4, 2)).double()
+    model.load_state_dict(baseline.state_dict())
+
+    x = torch.randn(5, 3, dtype=torch.float64)
+    target = torch.randn(5, 2, dtype=torch.float64)
+    criterion = nn.MSELoss()
+    tangents = {
+        name: torch.randn_like(parameter)
+        for name, parameter in model.named_parameters()
+    }
+
+    baseline_output = baseline(x)
+    baseline_loss = criterion(baseline_output, target)
+    baseline_loss.backward()
+    reference_hvps = _block_autodiff_hvps(baseline, criterion, x, target, tangents)
+
+    with modular_hvp(model, tangents):
+        output = model(x)
+        loss = criterion(output, target)
+        loss.backward()
+
+    assert torch.allclose(output.detach(), baseline_output.detach())
+    assert torch.allclose(loss.detach(), baseline_loss.detach())
+    for (_, expected), (_, actual) in zip(
+        baseline.named_parameters(), model.named_parameters(), strict=True
+    ):
+        assert torch.allclose(actual.grad, expected.grad)
+        assert actual.hvp is not None
+    for name, parameter in model.named_parameters():
+        assert torch.allclose(parameter.hvp, reference_hvps[name], rtol=1e-10, atol=1e-10)
+
+
+def test_default_modular_hvp_passes_dual_parameters_to_forward() -> None:
+    class InspectLinear(nn.Linear):
+        dual_weight_calls: int
+        dual_bias_calls: int
+        primal_calls: int
+
+        def __init__(self, in_features: int, out_features: int) -> None:
+            super().__init__(in_features, out_features)
+            self.dual_weight_calls = 0
+            self.dual_bias_calls = 0
+            self.primal_calls = 0
+
+        def forward(self, input: torch.Tensor) -> torch.Tensor:
+            weight_is_dual = is_dual(self.weight)
+            bias_is_dual = is_dual(self.bias)
+            self.dual_weight_calls += int(weight_is_dual)
+            self.dual_bias_calls += int(bias_is_dual)
+            self.primal_calls += int(not weight_is_dual and not bias_is_dual)
+            return super().forward(input)
+
+    torch.manual_seed(0)
+    model = nn.Sequential(InspectLinear(3, 2)).double()
+    x = torch.randn(5, 3, dtype=torch.float64)
+    target = torch.randn(5, 2, dtype=torch.float64)
+    criterion = nn.MSELoss()
+    tangents = {
+        name: torch.randn_like(parameter)
+        for name, parameter in model.named_parameters()
+    }
+
+    with modular_hvp(model, tangents):
+        criterion(model(x), target).backward()
+
+    layer = model[0]
+    assert layer.dual_weight_calls == 1
+    assert layer.dual_bias_calls == 1
+    assert layer.primal_calls == 1
+    for parameter in model.parameters():
+        assert parameter.hvp is not None
 
 
 def test_default_modular_hvp_accumulates_reused_parameter_hvps() -> None:

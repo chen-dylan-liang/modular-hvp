@@ -25,8 +25,12 @@ Current implementation status:
 - The primitive `DualTensor` backend implements the operator-overloading layer
   used by lower-level forward-mode tests and by the current local backward
   tensor programs.
-- The original hook-plumbing runtime remains available as an internal backend
-  extension point for future optimized dualized-backward integration.
+- The runtime keeps the public forward path as ordinary PyTorch execution. It
+  calls each module's original `forward`; local dual activations are generated
+  by temporarily replacing exactly one owning parameter with a `DualTensor` and
+  calling the same `forward` under the primitive backend.
+- The generic hook-plumbing runtime remains available as an internal extension
+  point for future optimized dualized-backward integration.
 
 The primitive dual-tensor backend is available independently for forward-mode
 operator tests:
@@ -92,11 +96,19 @@ current shared-parameter path uses a correctness fallback.
 
 The local runtime does not stack independent parameter epsilons into a global or
 multi-channel tangent. Each saved local dual activation is consumed separately
-for its owning parameter block. The backward-side tensor programs are expressed
-through ATen primitives and run through the `DualTensor` registry:
+for its owning parameter block.
 
-- Linear forward/backward pieces use `aten.mm`, `aten.t`, `aten.add`, and
-  `aten.sum`.
+The forward side does not reimplement module math. For both primal execution and
+local dual activation generation, the runtime calls the module's original
+`forward`; PyTorch then decomposes that code to ATen as usual, and the
+`DualTensor` backend only changes behavior when an ATen primitive receives a
+dual input.
+
+The current backward side is still the narrow MLP/MSE milestone, not the final
+general backward-hook runtime. Its tensor programs are expressed through ATen
+primitives and run through the `DualTensor` registry:
+
+- Linear backward-side pieces use `aten.mm`, `aten.t`, and `aten.sum`.
 - ReLU dispatches as `aten.relu.default`; its backward-side program uses
   `aten.threshold_backward.default`.
 - MSE loss dispatches as `aten.mse_loss.default`; its backward-side curvature
@@ -104,11 +116,11 @@ through ATen primitives and run through the `DualTensor` registry:
 
 | Setting | Method | Max abs error | Max rel error | Mean time | Median RSS delta | Max RSS delta |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| MNIST preset | `modular_hvp` | 0.000e+00 | 0.000e+00 | 29.137 ms | 2.64 MiB | 2.67 MiB |
-| MNIST preset | `backpack_hmp` | 1.118e-08 | 3.599e-07 | 27.151 ms | 4.92 MiB | 4.98 MiB |
-| MNIST preset | `backpack_autodiff` | 1.118e-08 | 3.599e-07 | 14.952 ms | 1.55 MiB | 1.79 MiB |
-| MNIST preset | `torch_backward` | n/a | n/a | 2.094 ms | 16.00 KiB | 16.00 KiB |
-| Larger stress | `modular_hvp` | 0.000e+00 | 0.000e+00 | 78.477 ms | 12.94 MiB | 12.95 MiB |
-| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 76.322 ms | 27.20 MiB | 27.20 MiB |
-| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 84.998 ms | 11.57 MiB | 11.57 MiB |
-| Larger stress | `torch_backward` | n/a | n/a | 9.897 ms | 16.00 KiB | 16.00 KiB |
+| MNIST preset | `modular_hvp` | 0.000e+00 | 0.000e+00 | 41.512 ms | 2.62 MiB | 2.70 MiB |
+| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 41.128 ms | 4.92 MiB | 4.96 MiB |
+| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 26.313 ms | 1.78 MiB | 1.84 MiB |
+| MNIST preset | `torch_backward` | n/a | n/a | 3.500 ms | 16.00 KiB | 16.00 KiB |
+| Larger stress | `modular_hvp` | 0.000e+00 | 0.000e+00 | 141.200 ms | 12.89 MiB | 13.04 MiB |
+| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 115.868 ms | 27.17 MiB | 27.19 MiB |
+| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 130.038 ms | 11.57 MiB | 11.57 MiB |
+| Larger stress | `torch_backward` | n/a | n/a | 11.966 ms | 16.00 KiB | 16.00 KiB |
