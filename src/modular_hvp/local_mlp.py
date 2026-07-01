@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from modular_hvp.dual import make_dual, tangent
+from modular_hvp.dual import _make_zero_dual, make_dual, tangent
 from modular_hvp.runtime import ParameterBlock, _resolve_parameter_blocks
 
 
@@ -23,7 +23,7 @@ class LinearForwardRecord:
 
 @dataclass(frozen=True, slots=True)
 class ReLUForwardRecord:
-    mask: torch.Tensor
+    input_primal: torch.Tensor
 
 
 ForwardRecord = LinearForwardRecord | ReLUForwardRecord
@@ -42,14 +42,20 @@ class LossPatch:
     original_mse_loss: Callable[..., torch.Tensor]
 
 
+@dataclass(frozen=True, slots=True)
+class MSELossRecord:
+    input_primal: torch.Tensor
+    target_primal: torch.Tensor
+    reduction: str
+
+
 @dataclass(slots=True)
 class RuntimeState:
     entered: bool = False
     forward_patch: ForwardPatch | None = None
     loss_patch: LossPatch | None = None
     records: list[ForwardRecord] = field(default_factory=list)
-    loss_curvature: tuple[str, float] | None = None
-    loss_gradient: torch.Tensor | None = None
+    loss_record: MSELossRecord | None = None
     primal_loss: torch.Tensor | None = None
     backward_called: bool = False
     output_id: int | None = None
@@ -60,7 +66,7 @@ class LocalMLPHVPRuntime:
 
     This runtime consumes parameter tangents inside the model forward and stores
     only local output tangents for the module that owns each parameter. It does
-    not propagate parameter tangent channels through later layers in forward.
+    not propagate parameter tangents through later layers in forward.
     """
 
     _ACTIVE_RUNTIME: "LocalMLPHVPRuntime | None" = None
@@ -115,8 +121,7 @@ class LocalMLPHVPRuntime:
             if getattr(module, self._ACTIVE_ATTR, False):
                 delattr(module, self._ACTIVE_ATTR)
         self._state.records.clear()
-        self._state.loss_curvature = None
-        self._state.loss_gradient = None
+        self._state.loss_record = None
         self._state.primal_loss = None
         self._state.output_id = None
         return None
@@ -138,16 +143,15 @@ class LocalMLPHVPRuntime:
             target_primal,
             reduction=reduction,
         )
-        if reduction == "mean":
-            coefficient = 2.0 / input_primal.numel()
-        elif reduction == "sum":
-            coefficient = 2.0
-        else:
+        if reduction not in {"mean", "sum"}:
             raise NotImplementedError(
                 "modular_hvp currently supports mse_loss reductions 'mean' and 'sum'"
             )
-        self._state.loss_curvature = ("scaled_identity", coefficient)
-        self._state.loss_gradient = (coefficient * (input_primal - target_primal)).detach()
+        self._state.loss_record = MSELossRecord(
+            input_primal=input_primal.detach(),
+            target_primal=target_primal.detach(),
+            reduction=reduction,
+        )
         self._state.primal_loss = primal_loss
         primal_loss.register_hook(self._make_loss_hook())
         return primal_loss
@@ -260,7 +264,7 @@ class LocalMLPHVPRuntime:
 
         weight_tangent = self._tangents_by_parameter.get(module.weight)
         if weight_tangent is not None:
-            output_hat = F.linear(
+            output_hat = _linear_forward_program(
                 input_primal,
                 make_dual(module.weight.detach(), weight_tangent.detach()),
                 module.bias.detach() if module.bias is not None else None,
@@ -270,14 +274,14 @@ class LocalMLPHVPRuntime:
         if module.bias is not None:
             bias_tangent = self._tangents_by_parameter.get(module.bias)
             if bias_tangent is not None:
-                output_hat = F.linear(
+                output_hat = _linear_forward_program(
                     input_primal,
                     module.weight.detach(),
                     make_dual(module.bias.detach(), bias_tangent.detach()),
                 )
                 local_duals[module.bias] = tangent(output_hat).detach()
 
-        output = F.linear(input_value, module.weight, module.bias)
+        output = _linear_forward_program(input_value, module.weight, module.bias)
         self._state.records.append(
             LinearForwardRecord(
                 module=module,
@@ -294,45 +298,65 @@ class LocalMLPHVPRuntime:
     ) -> torch.Tensor:
         if module.inplace:
             raise NotImplementedError("LocalMLPHVPRuntime does not support inplace ReLU")
-        mask = input_value.detach() > 0
+        input_primal = input_value.detach()
         output = F.relu(input_value)
-        self._state.records.append(ReLUForwardRecord(mask=mask))
+        self._state.records.append(ReLUForwardRecord(input_primal=input_primal))
         return output
 
     def _compute_hvps(self) -> None:
-        loss_curvature = self._state.loss_curvature
-        if loss_curvature is None:
+        loss_record = self._state.loss_record
+        if loss_record is None:
             raise RuntimeError(
                 "modular_hvp did not observe a supported scalar loss; "
                 "currently use torch.nn.MSELoss or torch.nn.functional.mse_loss"
             )
-        _, coefficient = loss_curvature
         if any(count > 1 for count in self._parameter_use_counts.values()):
             self._compute_reused_parameter_hvps_autodiff()
             return
 
-        def curvature_apply(vector: torch.Tensor) -> torch.Tensor:
-            return coefficient * vector
+        loss_input_primal = loss_record.input_primal
+        loss_target_primal = loss_record.target_primal
+        loss_reduction = loss_record.reduction
+
+        def curvature_apply(
+            vector: torch.Tensor,
+            *,
+            loss_input_primal: torch.Tensor = loss_input_primal,
+            loss_target_primal: torch.Tensor = loss_target_primal,
+            loss_reduction: str = loss_reduction,
+        ) -> torch.Tensor:
+            gradient_hat = _mse_input_backward_program(
+                make_dual(loss_input_primal, vector),
+                loss_target_primal,
+                loss_input_primal.new_ones(()),
+                loss_reduction,
+            )
+            return tangent(gradient_hat)
 
         hvps: dict[nn.Parameter, torch.Tensor] = {}
         with torch.no_grad():
             for record in reversed(self._state.records):
                 if isinstance(record, ReLUForwardRecord):
                     previous_curvature_apply = curvature_apply
-                    mask = record.mask
+                    input_primal = record.input_primal
 
                     def relu_curvature_apply(
                         vector: torch.Tensor,
                         *,
-                        mask: torch.Tensor = mask,
+                        input_primal: torch.Tensor = input_primal,
                         previous_curvature_apply: Any = previous_curvature_apply,
                     ) -> torch.Tensor:
-                        masked = torch.where(mask, vector, vector.new_zeros(()))
-                        return torch.where(
-                            mask,
-                            previous_curvature_apply(masked),
-                            vector.new_zeros(()),
+                        output_tangent = tangent(
+                            torch.ops.aten.relu.default(
+                                make_dual(input_primal, vector)
+                            )
                         )
+                        output_curvature = previous_curvature_apply(output_tangent)
+                        input_curvature_hat = _relu_backward_program(
+                            input_primal,
+                            _make_zero_dual(output_curvature),
+                        )
+                        return tangent(input_curvature_hat)
 
                     curvature_apply = relu_curvature_apply
                     continue
@@ -340,10 +364,16 @@ class LocalMLPHVPRuntime:
                 input_primal = record.input_primal
                 for parameter, local_dual in record.local_dual_activations.items():
                     curved_dual = curvature_apply(local_dual)
+                    grad_output_hat = _make_zero_dual(curved_dual)
+                    _, grad_weight_hat, grad_bias_hat = _linear_backward_program(
+                        input_primal,
+                        record.module.weight.detach(),
+                        grad_output_hat,
+                    )
                     if parameter is record.module.weight:
-                        hvp = curved_dual.t().matmul(input_primal)
+                        hvp = tangent(grad_weight_hat)
                     elif parameter is record.module.bias:
-                        hvp = curved_dual.sum(dim=0)
+                        hvp = tangent(grad_bias_hat)
                     else:
                         raise RuntimeError("local dual activation belongs to wrong module")
                     existing_hvp = hvps.get(parameter)
@@ -358,9 +388,19 @@ class LocalMLPHVPRuntime:
                     weight: torch.Tensor = weight,
                     previous_curvature_apply: Any = previous_curvature_apply,
                 ) -> torch.Tensor:
-                    output_tangent = vector.matmul(weight.t())
+                    output_tangent = tangent(
+                        _linear_forward_program(
+                            _make_zero_dual(vector),
+                            weight,
+                            None,
+                        )
+                    )
                     output_curvature = previous_curvature_apply(output_tangent)
-                    return output_curvature.matmul(weight)
+                    input_curvature_hat = _linear_input_backward_program(
+                        weight,
+                        _make_zero_dual(output_curvature),
+                    )
+                    return tangent(input_curvature_hat)
 
                 curvature_apply = linear_curvature_apply
 
@@ -421,6 +461,72 @@ def _iter_supported_modules(model: nn.Module) -> tuple[nn.Module, ...]:
     if isinstance(model, nn.Sequential):
         return tuple(model._modules.values())
     raise TypeError("unsupported model type")
+
+
+def _linear_forward_program(
+    input_value: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    output = torch.ops.aten.mm.default(
+        input_value,
+        torch.ops.aten.t.default(weight),
+    )
+    if bias is not None:
+        output = torch.ops.aten.add.Tensor(output, bias)
+    return output
+
+
+def _linear_backward_program(
+    input_value: torch.Tensor,
+    weight: torch.Tensor,
+    grad_output: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    grad_input = _linear_input_backward_program(weight, grad_output)
+    grad_weight = torch.ops.aten.mm.default(
+        torch.ops.aten.t.default(grad_output),
+        input_value,
+    )
+    grad_bias = torch.ops.aten.sum.dim_IntList(grad_output, [0], False)
+    return grad_input, grad_weight, grad_bias
+
+
+def _linear_input_backward_program(
+    weight: torch.Tensor,
+    grad_output: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops.aten.mm.default(grad_output, weight)
+
+
+def _relu_backward_program(
+    input_value: torch.Tensor,
+    grad_output: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops.aten.threshold_backward.default(grad_output, input_value, 0)
+
+
+def _mse_input_backward_program(
+    input_value: torch.Tensor,
+    target: torch.Tensor,
+    grad_output: torch.Tensor,
+    reduction: str,
+) -> torch.Tensor:
+    return torch.ops.aten.mse_loss_backward.default(
+        grad_output,
+        input_value,
+        target,
+        _mse_reduction_enum(reduction),
+    )
+
+
+def _mse_reduction_enum(reduction: str) -> int:
+    if reduction == "none":
+        return 0
+    if reduction == "mean":
+        return 1
+    if reduction == "sum":
+        return 2
+    raise ValueError(f"unknown mse_loss reduction: {reduction!r}")
 
 
 def _parameter_use_counts(model: nn.Module) -> dict[nn.Parameter, int]:

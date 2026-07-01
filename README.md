@@ -23,7 +23,8 @@ Current implementation status:
 - The default `modular_hvp(...)` context computes per-parameter block HVPs for
   Linear/ReLU MLPs with MSE loss using local dual activations.
 - The primitive `DualTensor` backend implements the operator-overloading layer
-  used by lower-level forward-mode tests.
+  used by lower-level forward-mode tests and by the current local backward
+  tensor programs.
 - The original hook-plumbing runtime remains available as an internal backend
   extension point for future optimized dualized-backward integration.
 
@@ -87,18 +88,27 @@ and follows the per-parameter locality rules: each parameter tangent is consumed
 inside its owning Linear forward, the normal model receives only the primal
 activation, and the saved local dual activation is consumed later to write the
 single public `p.hvp`. Reused parameters accumulate into that same `p.hvp`; the
-current shared-parameter path uses a correctness fallback. This first local
-runtime is still scoped to Linear/ReLU/MSE and uses explicit local backward
-primitives for that scope; the next step is to route more of that backward
-dualization through the generic primitive operator backend.
+current shared-parameter path uses a correctness fallback.
+
+The local runtime does not stack independent parameter epsilons into a global or
+multi-channel tangent. Each saved local dual activation is consumed separately
+for its owning parameter block. The backward-side tensor programs are expressed
+through ATen primitives and run through the `DualTensor` registry:
+
+- Linear forward/backward pieces use `aten.mm`, `aten.t`, `aten.add`, and
+  `aten.sum`.
+- ReLU dispatches as `aten.relu.default`; its backward-side program uses
+  `aten.threshold_backward.default`.
+- MSE loss dispatches as `aten.mse_loss.default`; its backward-side curvature
+  program uses `aten.mse_loss_backward.default`.
 
 | Setting | Method | Max abs error | Max rel error | Mean time | Median RSS delta | Max RSS delta |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| MNIST preset | `modular_hvp` | 0.000e+00 | 0.000e+00 | 13.232 ms | 1.86 MiB | 1.89 MiB |
-| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 24.834 ms | 4.94 MiB | 4.98 MiB |
-| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 16.231 ms | 1.78 MiB | 1.81 MiB |
-| MNIST preset | `torch_backward` | n/a | n/a | 1.845 ms | 16.00 KiB | 24.00 KiB |
-| Larger stress | `modular_hvp` | 0.000e+00 | 0.000e+00 | 50.622 ms | 7.11 MiB | 7.11 MiB |
-| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 77.961 ms | 27.24 MiB | 27.25 MiB |
-| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 84.831 ms | 11.57 MiB | 11.68 MiB |
-| Larger stress | `torch_backward` | n/a | n/a | 9.083 ms | 16.00 KiB | 16.00 KiB |
+| MNIST preset | `modular_hvp` | 0.000e+00 | 0.000e+00 | 29.137 ms | 2.64 MiB | 2.67 MiB |
+| MNIST preset | `backpack_hmp` | 1.118e-08 | 3.599e-07 | 27.151 ms | 4.92 MiB | 4.98 MiB |
+| MNIST preset | `backpack_autodiff` | 1.118e-08 | 3.599e-07 | 14.952 ms | 1.55 MiB | 1.79 MiB |
+| MNIST preset | `torch_backward` | n/a | n/a | 2.094 ms | 16.00 KiB | 16.00 KiB |
+| Larger stress | `modular_hvp` | 0.000e+00 | 0.000e+00 | 78.477 ms | 12.94 MiB | 12.95 MiB |
+| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 76.322 ms | 27.20 MiB | 27.20 MiB |
+| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 84.998 ms | 11.57 MiB | 11.57 MiB |
+| Larger stress | `torch_backward` | n/a | n/a | 9.897 ms | 16.00 KiB | 16.00 KiB |

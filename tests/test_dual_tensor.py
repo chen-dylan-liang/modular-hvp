@@ -195,6 +195,23 @@ def test_mse_loss_matches_finite_difference() -> None:
     assert torch.allclose(tangent(output), fd, rtol=1e-6, atol=1e-6)
 
 
+def test_mse_loss_backward_matches_finite_difference() -> None:
+    torch.manual_seed(7)
+    x = torch.randn(5, 2, dtype=torch.float64)
+    target = torch.randn(5, 2, dtype=torch.float64)
+    x_dot = torch.randn_like(x)
+    grad_output = torch.ones((), dtype=torch.float64)
+
+    def fn(x_value: torch.Tensor) -> torch.Tensor:
+        return torch.ops.aten.mse_loss_backward.default(grad_output, x_value, target, 1)
+
+    output = fn(make_dual(x, x_dot))
+    fd = _central_difference(fn, (x,), (x_dot,))
+
+    assert torch.allclose(primal(output), fn(x))
+    assert torch.allclose(tangent(output), fd, rtol=1e-6, atol=1e-6)
+
+
 def test_reverse_scalar_and_matmul_rules() -> None:
     x = torch.tensor([2.0, 4.0], dtype=torch.float64)
     x_dot = torch.tensor([0.5, -1.0], dtype=torch.float64)
