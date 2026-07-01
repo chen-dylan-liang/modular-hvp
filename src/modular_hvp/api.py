@@ -8,6 +8,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from modular_hvp.block_dual import BlockDualHVPRuntime
 from modular_hvp.backend import DualBackend, FakeDualBackend
 from modular_hvp.runtime import ModularHVPRuntime
 
@@ -30,8 +31,8 @@ def modular_hvp(
         The first milestone requires one matching tangent for every trainable
         parameter.
     backend:
-        Internal extension point for the dual operator backend. The default is
-        a fake backend that exercises hook plumbing and writes zero HVPs.
+        Internal extension point for the hook-plumbing runtime. When omitted,
+        the integrated block-dual runtime computes per-parameter HVPs.
     """
 
     if not isinstance(model, nn.Module):
@@ -39,4 +40,6 @@ def modular_hvp(
     if not isinstance(v, Mapping):
         raise TypeError("v must be a mapping from parameter names or objects to tensors")
 
-    return ModularHVPRuntime(model=model, tangents=v, backend=backend or FakeDualBackend())
+    if backend is not None:
+        return ModularHVPRuntime(model=model, tangents=v, backend=backend)
+    return BlockDualHVPRuntime(model=model, tangents=v)

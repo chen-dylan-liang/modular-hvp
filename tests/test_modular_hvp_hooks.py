@@ -7,7 +7,7 @@ import pytest
 import torch
 from torch import nn
 
-from modular_hvp import FakeDualBackend, LocalDualActivations, modular_hvp
+from modular_hvp import BlockDualTensor, FakeDualBackend, LocalDualActivations, modular_hvp
 
 
 def _tangents_by_name(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -16,6 +16,33 @@ def _tangents_by_name(model: nn.Module) -> dict[str, torch.Tensor]:
         for name, parameter in model.named_parameters()
         if parameter.requires_grad
     }
+
+
+def _block_autodiff_hvps(
+    model: nn.Module,
+    loss_fn: nn.Module,
+    x: torch.Tensor,
+    target: torch.Tensor,
+    tangents: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    loss = loss_fn(model(x), target)
+    hvps: dict[str, torch.Tensor] = {}
+    for name, parameter in model.named_parameters():
+        gradient = torch.autograd.grad(
+            loss,
+            [parameter],
+            create_graph=True,
+            retain_graph=True,
+            materialize_grads=True,
+        )[0]
+        directional_gradient = (gradient * tangents[name]).sum()
+        hvps[name] = torch.autograd.grad(
+            directional_gradient,
+            [parameter],
+            retain_graph=True,
+            materialize_grads=True,
+        )[0].detach()
+    return hvps
 
 
 class RecordingBackend(FakeDualBackend):
@@ -86,7 +113,39 @@ class CountingBackend(FakeDualBackend):
         )
 
 
-def test_modular_hvp_preserves_primal_forward_and_gradients() -> None:
+def test_default_modular_hvp_matches_block_autodiff_on_mlp() -> None:
+    torch.manual_seed(0)
+    baseline = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2)).double()
+    model = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2)).double()
+    model.load_state_dict(baseline.state_dict())
+
+    x = torch.randn(5, 3, dtype=torch.float64)
+    target = torch.randn(5, 2, dtype=torch.float64)
+    criterion = nn.MSELoss()
+    tangents = {
+        name: torch.randn_like(parameter)
+        for name, parameter in model.named_parameters()
+    }
+
+    baseline_loss = criterion(baseline(x), target)
+    baseline_loss.backward()
+    reference_hvps = _block_autodiff_hvps(baseline, criterion, x, target, tangents)
+
+    with modular_hvp(model, tangents):
+        loss = criterion(model(x), target)
+        loss.backward()
+
+    assert torch.allclose(loss.primal.detach(), baseline_loss.detach())
+    for (_, expected), (_, actual) in zip(
+        baseline.named_parameters(), model.named_parameters(), strict=True
+    ):
+        assert torch.allclose(actual.grad, expected.grad)
+        assert actual.hvp is not None
+    for name, parameter in model.named_parameters():
+        assert torch.allclose(parameter.hvp, reference_hvps[name], rtol=1e-10, atol=1e-10)
+
+
+def test_explicit_hook_backend_preserves_primal_forward_and_gradients() -> None:
     torch.manual_seed(0)
     baseline = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2))
     model = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2))
@@ -111,16 +170,26 @@ def test_modular_hvp_preserves_primal_forward_and_gradients() -> None:
         assert torch.allclose(actual.grad, expected.grad)
         assert actual.hvp is not None
         assert torch.equal(actual.hvp, torch.zeros_like(actual))
-
     assert backend.local_forward_modules == ["Linear", "Linear"]
     assert backend.backward_modules == ["Linear", "Linear"]
 
 
-def test_context_restores_forward_and_removes_active_flags() -> None:
+def test_default_context_restores_parameters_and_removes_active_flags() -> None:
+    model = nn.Linear(3, 2)
+    original_weight = model.weight
+
+    with modular_hvp(model, _tangents_by_name(model)):
+        assert isinstance(model._parameters["weight"], BlockDualTensor)
+
+    assert model.weight is original_weight
+    assert not hasattr(model, "_modular_hvp_block_dual_active")
+
+
+def test_explicit_hook_context_restores_forward_and_removes_active_flags() -> None:
     model = nn.Linear(3, 2)
     original_forward = model.forward
 
-    with modular_hvp(model, _tangents_by_name(model)):
+    with modular_hvp(model, _tangents_by_name(model), backend=FakeDualBackend()):
         assert model.forward is not original_forward
 
     assert "forward" not in model.__dict__
@@ -137,11 +206,12 @@ def test_parameter_object_tangent_keys_are_supported() -> None:
     }
 
     with modular_hvp(model, tangents):
-        model(torch.randn(4, 3)).sum().backward()
+        loss = model(torch.randn(4, 3)).pow(2).mean()
+        loss.backward()
 
     for parameter in model.parameters():
         assert parameter.hvp is not None
-        assert torch.equal(parameter.hvp, torch.zeros_like(parameter))
+        assert parameter.hvp.shape == parameter.shape
 
 
 def test_missing_tangent_is_rejected() -> None:
@@ -199,6 +269,7 @@ def test_existing_stale_hvp_is_cleared_on_entry() -> None:
     model.weight.hvp = torch.full_like(model.weight, 17.0)
 
     with modular_hvp(model, _tangents_by_name(model)):
-        model(torch.randn(4, 3)).sum().backward()
+        model(torch.randn(4, 3)).pow(2).mean().backward()
 
-    assert torch.equal(model.weight.hvp, torch.zeros_like(model.weight))
+    assert model.weight.hvp is not None
+    assert not torch.equal(model.weight.hvp, torch.full_like(model.weight, 17.0))

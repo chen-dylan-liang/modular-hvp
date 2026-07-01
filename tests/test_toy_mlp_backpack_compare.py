@@ -6,7 +6,7 @@ from benchmarks.compare_toy_mlp import (
     backpack_hmp_block_hvp,
     compare_results,
     make_problem,
-    modular_dual_block_hvp,
+    modular_hvp_block_hvp,
 )
 
 
@@ -21,7 +21,7 @@ def test_toy_mlp_block_hvps_match_backpack_baselines() -> None:
     )
 
     model, loss_fn, x, target, vectors = make_problem(config)
-    ours = modular_dual_block_hvp(model, loss_fn, x, target, vectors)
+    ours = modular_hvp_block_hvp(model, loss_fn, x, target, vectors)
 
     model, loss_fn, x, target, vectors = make_problem(config)
     hmp = backpack_hmp_block_hvp(model, loss_fn, x, target, vectors)

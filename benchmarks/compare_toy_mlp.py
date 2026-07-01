@@ -1,16 +1,4 @@
-"""Compare toy-MLP block HVPs against BackPACK baselines.
-
-This script benchmarks three per-parameter block-HVP paths plus a standard
-PyTorch backward pass baseline:
-
-1. ModularHVP's current DualTensor backend plus autograd on the dual loss tangent.
-2. BackPACK HMP, which stores a per-parameter Hessian-matrix-product closure.
-3. BackPACK's reverse-over-reverse hessian_vector_product utility.
-4. Standard PyTorch ``loss.backward()`` for ordinary gradients.
-
-The ModularHVP path here is still a toy backend comparison, not the final
-``with modular_hvp(...): loss.backward()`` integration.
-"""
+"""Compare public ``modular_hvp(...)`` block HVPs against fair baselines."""
 
 from __future__ import annotations
 
@@ -22,13 +10,12 @@ import time
 import tracemalloc
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from typing import Any
 
 import psutil
 import torch
 from torch import nn
 
-from modular_hvp import make_dual, run_with_dual_parameter, tangent
+from modular_hvp import modular_hvp
 
 
 @dataclass(frozen=True)
@@ -99,7 +86,10 @@ def make_problem(
     loss_fn = nn.MSELoss(reduction="mean")
     x = torch.randn(config.batch_size, config.d_in, device=config.device, dtype=dtype)
     target = torch.randn(
-        config.batch_size, config.d_out, device=config.device, dtype=dtype
+        config.batch_size,
+        config.d_out,
+        device=config.device,
+        dtype=dtype,
     )
     vectors = {
         name: torch.randn_like(parameter)
@@ -109,167 +99,27 @@ def make_problem(
     return model, loss_fn, x, target, vectors
 
 
-def modular_dual_block_hvp(
+def modular_hvp_block_hvp(
     model: nn.Module,
     loss_fn: nn.Module,
     x: torch.Tensor,
     target: torch.Tensor,
     vectors: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Compute one ``H_pp @ v_p`` per parameter using the DualTensor backend."""
+    """Compute block HVPs through the public ModularHVP context manager."""
 
-    params = dict(model.named_parameters())
+    with modular_hvp(model, vectors):
+        output = model(x)
+        loss = loss_fn(output, target)
+        loss.backward()
+
     hvps: dict[str, torch.Tensor] = {}
-
-    for param in params.values():
-        setattr(param, "hvp", None)
-
-    original_requires_grad = {
-        name: param.requires_grad for name, param in params.items()
-    }
-    try:
-        for param in params.values():
-            param.requires_grad_(False)
-
-        if isinstance(model, nn.Sequential):
-            hvps.update(
-                _modular_dual_sequential_mlp_block_hvp(
-                    model,
-                    loss_fn,
-                    x,
-                    target,
-                    vectors,
-                    params,
-                    original_requires_grad,
-                )
-            )
-        else:
-            hvps.update(
-                _modular_dual_full_forward_block_hvp(
-                    model,
-                    loss_fn,
-                    x,
-                    target,
-                    vectors,
-                    params,
-                    original_requires_grad,
-                )
-            )
-    finally:
-        for name, param in params.items():
-            param.requires_grad_(original_requires_grad[name])
-
+    for name, parameter in model.named_parameters():
+        hvp = getattr(parameter, "hvp", None)
+        if hvp is None:
+            raise RuntimeError(f"missing HVP for parameter {name!r}")
+        hvps[name] = hvp.detach()
     return hvps
-
-
-def _modular_dual_full_forward_block_hvp(
-    model: nn.Module,
-    loss_fn: nn.Module,
-    x: torch.Tensor,
-    target: torch.Tensor,
-    vectors: dict[str, torch.Tensor],
-    params: dict[str, torch.Tensor],
-    original_requires_grad: dict[str, bool],
-) -> dict[str, torch.Tensor]:
-    hvps: dict[str, torch.Tensor] = {}
-    for name, param in params.items():
-        if not original_requires_grad[name]:
-            continue
-        param.requires_grad_(True)
-        output_hat = run_with_dual_parameter(model, name, vectors[name], x)
-        hvp = _hvp_from_dual_output(loss_fn, output_hat, target, param)
-        param.requires_grad_(False)
-        setattr(param, "hvp", hvp)
-        hvps[name] = hvp
-    return hvps
-
-
-def _modular_dual_sequential_mlp_block_hvp(
-    model: nn.Sequential,
-    loss_fn: nn.Module,
-    x: torch.Tensor,
-    target: torch.Tensor,
-    vectors: dict[str, torch.Tensor],
-    params: dict[str, torch.Tensor],
-    original_requires_grad: dict[str, bool],
-) -> dict[str, torch.Tensor]:
-    module_entries = tuple(model._modules.items())
-    suffix_modules = tuple(model.children())
-    prefix_activation = x
-    hvps: dict[str, torch.Tensor] = {}
-
-    for module_index, (module_name, module) in enumerate(module_entries):
-        if not isinstance(module, nn.Linear):
-            with torch.no_grad():
-                prefix_activation = module(prefix_activation)
-            continue
-
-        for leaf_name in ("weight", "bias"):
-            param_name = f"{module_name}.{leaf_name}"
-            param = params.get(param_name)
-            if param is None or not original_requires_grad[param_name]:
-                continue
-
-            tangent_value = vectors[param_name]
-            param.requires_grad_(True)
-            output_hat = _run_sequential_suffix_with_dual_parameter(
-                model,
-                start_index=module_index,
-                suffix_modules=suffix_modules,
-                param_name=param_name,
-                tangent_value=tangent_value,
-                input_value=prefix_activation.detach(),
-            )
-            hvp = _hvp_from_dual_output(loss_fn, output_hat, target, param)
-            param.requires_grad_(False)
-            setattr(param, "hvp", hvp)
-            hvps[param_name] = hvp
-
-        with torch.no_grad():
-            prefix_activation = module(prefix_activation)
-
-    return hvps
-
-
-def _run_sequential_suffix_with_dual_parameter(
-    model: nn.Sequential,
-    *,
-    start_index: int,
-    suffix_modules: tuple[nn.Module, ...],
-    param_name: str,
-    tangent_value: torch.Tensor,
-    input_value: torch.Tensor,
-) -> torch.Tensor:
-    module_path, _, leaf_name = param_name.rpartition(".")
-    owner_module = model.get_submodule(module_path)
-    original = owner_module._parameters[leaf_name]
-    if original is None:
-        raise ValueError(f"parameter {param_name!r} is None")
-
-    owner_module._parameters[leaf_name] = make_dual(original, tangent_value)
-    try:
-        output = input_value
-        for suffix_module in suffix_modules[start_index:]:
-            output = suffix_module(output)
-        return output
-    finally:
-        owner_module._parameters[leaf_name] = original
-
-
-def _hvp_from_dual_output(
-    loss_fn: nn.Module,
-    output_hat: torch.Tensor,
-    target: torch.Tensor,
-    param: torch.Tensor,
-) -> torch.Tensor:
-    loss_hat = loss_fn(output_hat, target)
-    return torch.autograd.grad(
-        tangent(loss_hat),
-        param,
-        create_graph=False,
-        retain_graph=False,
-        materialize_grads=True,
-    )[0].detach()
 
 
 def backpack_hmp_block_hvp(
@@ -294,7 +144,7 @@ def backpack_hmp_block_hvp(
 def _make_backpack_hmp_problem(
     config: ToyMLPConfig,
 ) -> tuple[nn.Module, nn.Module, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    """Create a problem with BackPACK extension outside timed benchmark scope."""
+    """Create a BackPACK-extended problem outside timed benchmark scope."""
 
     from backpack import extend
 
@@ -325,10 +175,8 @@ def _backpack_hmp_prepared_block_hvp(
         loss.backward()
 
     hvps: dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
-        hvp = param.hmp(vectors[name].unsqueeze(0))[0].detach()
-        setattr(param, "hvp", hvp)
-        hvps[name] = hvp
+    for name, parameter in model.named_parameters():
+        hvps[name] = parameter.hmp(vectors[name].unsqueeze(0))[0].detach()
     return hvps
 
 
@@ -346,11 +194,12 @@ def backpack_autodiff_block_hvp(
     params = dict(model.named_parameters())
     loss = loss_fn(model(x), target)
     hvps: dict[str, torch.Tensor] = {}
-
-    for name, param in params.items():
-        hvp = hessian_vector_product(loss, [param], [vectors[name]])[0].detach()
-        setattr(param, "hvp", hvp)
-        hvps[name] = hvp
+    for name, parameter in params.items():
+        hvps[name] = hessian_vector_product(
+            loss,
+            [parameter],
+            [vectors[name]],
+        )[0].detach()
     return hvps
 
 
@@ -367,9 +216,9 @@ def torch_backward_pass(
     loss = loss_fn(model(x), target)
     loss.backward()
     return {
-        name: param.grad.detach()
-        for name, param in model.named_parameters()
-        if param.grad is not None
+        name: parameter.grad.detach()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
     }
 
 
@@ -393,7 +242,7 @@ def benchmark_method(
     method: BlockHVPFn,
     config: ToyMLPConfig,
     *,
-    problem_factory: ProblemFactory = make_problem,
+    problem_factory: ProblemFactory,
     warmup: int,
     repeats: int,
     rss_sample_interval_s: float,
@@ -504,9 +353,9 @@ def _dtype(name: str) -> torch.dtype:
 
 def _methods() -> dict[str, MethodSpec]:
     return {
-        "modular_dual": MethodSpec(
-            "modular_dual",
-            modular_dual_block_hvp,
+        "modular_hvp": MethodSpec(
+            "modular_hvp",
+            modular_hvp_block_hvp,
             make_problem,
         ),
         "backpack_hmp": MethodSpec(
@@ -544,7 +393,7 @@ def _print_results(
     comparisons: dict[str, dict[str, float]],
     stats: list[MethodStats],
 ) -> None:
-    print("HVP correctness vs modular_dual")
+    print("HVP correctness vs modular_hvp")
     for method, errors in comparisons.items():
         print(
             f"  {method:17s} max_abs={errors['max_abs']:.3e} "
@@ -631,7 +480,7 @@ def main() -> None:
     )
 
     methods = _methods()
-    reference_spec = methods["modular_dual"]
+    reference_spec = methods["modular_hvp"]
     model, loss_fn, x, target, vectors = reference_spec.make_problem(config)
     reference = reference_spec.fn(model, loss_fn, x, target, vectors)
 
