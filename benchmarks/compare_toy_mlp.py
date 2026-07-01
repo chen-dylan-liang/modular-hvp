@@ -1,10 +1,12 @@
 """Compare toy-MLP block HVPs against BackPACK baselines.
 
-This script benchmarks three per-parameter block-HVP paths:
+This script benchmarks three per-parameter block-HVP paths plus a standard
+PyTorch backward pass baseline:
 
 1. ModularHVP's current DualTensor backend plus autograd on the dual loss tangent.
 2. BackPACK HMP, which stores a per-parameter Hessian-matrix-product closure.
 3. BackPACK's reverse-over-reverse hessian_vector_product utility.
+4. Standard PyTorch ``loss.backward()`` for ordinary gradients.
 
 The ModularHVP path here is still a toy backend comparison, not the final
 ``with modular_hvp(...): loss.backward()`` integration.
@@ -68,6 +70,7 @@ class MethodSpec:
     name: str
     fn: BlockHVPFn
     make_problem: ProblemFactory
+    compare_hvp: bool = True
 
 
 def make_toy_mlp(config: ToyMLPConfig) -> nn.Sequential:
@@ -351,6 +354,25 @@ def backpack_autodiff_block_hvp(
     return hvps
 
 
+def torch_backward_pass(
+    model: nn.Module,
+    loss_fn: nn.Module,
+    x: torch.Tensor,
+    target: torch.Tensor,
+    vectors: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Run a standard forward/loss/backward pass and return ordinary gradients."""
+
+    del vectors
+    loss = loss_fn(model(x), target)
+    loss.backward()
+    return {
+        name: param.grad.detach()
+        for name, param in model.named_parameters()
+        if param.grad is not None
+    }
+
+
 def compare_results(
     reference: dict[str, torch.Tensor],
     candidate: dict[str, torch.Tensor],
@@ -497,6 +519,12 @@ def _methods() -> dict[str, MethodSpec]:
             backpack_autodiff_block_hvp,
             make_problem,
         ),
+        "torch_backward": MethodSpec(
+            "torch_backward",
+            torch_backward_pass,
+            make_problem,
+            compare_hvp=False,
+        ),
     }
 
 
@@ -516,7 +544,7 @@ def _print_results(
     comparisons: dict[str, dict[str, float]],
     stats: list[MethodStats],
 ) -> None:
-    print("Correctness vs modular_dual")
+    print("HVP correctness vs modular_dual")
     for method, errors in comparisons.items():
         print(
             f"  {method:17s} max_abs={errors['max_abs']:.3e} "
@@ -609,6 +637,8 @@ def main() -> None:
 
     comparisons: dict[str, dict[str, float]] = {}
     for name, spec in methods.items():
+        if not spec.compare_hvp:
+            continue
         model, loss_fn, x, target, vectors = spec.make_problem(config)
         candidate = spec.fn(model, loss_fn, x, target, vectors)
         comparisons[name] = compare_results(reference, candidate)

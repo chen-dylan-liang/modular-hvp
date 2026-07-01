@@ -3,8 +3,7 @@
 ModularHVP is an eager PyTorch-compatible runtime for computing block-scoped
 Hessian-vector products during ordinary backward execution.
 
-The initial implementation provides the hook-plumbing milestone for
-per-parameter blocks:
+The target public API is:
 
 ```python
 from modular_hvp import modular_hvp
@@ -19,9 +18,15 @@ for name, p in model.named_parameters():
     p.hvp
 ```
 
-The current `modular_hvp(...)` context backend is intentionally fake: it
-preserves the runtime shape and writes zero HVP tensors. Integration between
-the hook runtime and primitive dual tensor rules is a later milestone.
+Current implementation status:
+
+- The `modular_hvp(...)` context manager provides the per-parameter hook
+  runtime, state management, and `p.grad`/`p.hvp` lifecycle.
+- The primitive `DualTensor` backend implements the operator-overloading layer
+  needed by MLP-style tensor programs.
+- The current numerical HVP benchmark uses the `DualTensor` backend directly.
+  Wiring that backend into the default `modular_hvp(...)` context is the next
+  integration step.
 
 The primitive dual-tensor backend is available independently for forward-mode
 operator tests:
@@ -41,8 +46,9 @@ when a `DualTensor` reaches an unsupported operation.
 
 ## Toy MLP Comparison
 
-The BackPACK comparison script checks per-parameter block HVPs on a small MLP
-against BackPACK HMP and BackPACK's reverse-over-reverse HVP utility:
+The BackPACK comparison script checks per-parameter block HVPs on MLPs against
+BackPACK HMP and BackPACK's reverse-over-reverse HVP utility. It also reports a
+standard PyTorch `loss.backward()` pass as a first-order baseline:
 
 ```bash
 uv run python benchmarks/compare_toy_mlp.py
@@ -54,9 +60,11 @@ For less noisy memory measurements, use the synthetic MNIST-shaped MLP preset:
 uv run python benchmarks/compare_toy_mlp.py --preset mnist-mlp
 ```
 
-The script reports max absolute/relative error against the ModularHVP
+The script reports max absolute/relative HVP error against the ModularHVP
 DualTensor path plus wall-clock time, median/max sampled RSS delta, Python
-allocation peak, and CUDA allocation peak when running on CUDA.
+allocation peak, and CUDA allocation peak when running on CUDA. The
+`torch_backward` row is a timing and memory baseline only; it computes ordinary
+gradients, not HVPs.
 
 `RSS delta` is the sampled increase in the process's resident set size during a
 method run. It is a coarse process-level measurement, so tiny toy runs can be
@@ -76,11 +84,18 @@ For `backpack_hmp`, BackPACK's `extend(...)` setup is performed before the
 timed region. The measured region contains the forward pass, BackPACK HMP
 backward pass, and one `param.hmp(...)` application per parameter.
 
+The current `modular_dual` benchmark path computes per-parameter block HVPs by
+running the relevant suffix computation for each active parameter block. It is
+therefore a backend milestone benchmark, not yet the expected cost profile of
+the final integrated `modular_hvp(...): loss.backward()` runtime.
+
 | Setting | Method | Max abs error | Max rel error | Mean time | Median RSS delta | Max RSS delta |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| MNIST preset | `modular_dual` | 0.000e+00 | 0.000e+00 | 13.904 ms | 54.00 KiB | 176.00 KiB |
-| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 24.726 ms | 5.44 MiB | 5.48 MiB |
-| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 14.489 ms | 1.21 MiB | 1.31 MiB |
-| Larger stress | `modular_dual` | 0.000e+00 | 0.000e+00 | 56.059 ms | 152.00 KiB | 232.00 KiB |
-| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 74.157 ms | 28.20 MiB | 28.25 MiB |
-| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 76.694 ms | 11.59 MiB | 11.59 MiB |
+| MNIST preset | `modular_dual` | 0.000e+00 | 0.000e+00 | 14.358 ms | 44.00 KiB | 116.00 KiB |
+| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 25.653 ms | 5.41 MiB | 5.57 MiB |
+| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 13.411 ms | 1.28 MiB | 1.43 MiB |
+| MNIST preset | `torch_backward` | n/a | n/a | 1.773 ms | 16.00 KiB | 20.00 KiB |
+| Larger stress | `modular_dual` | 0.000e+00 | 0.000e+00 | 54.253 ms | 128.00 KiB | 204.00 KiB |
+| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 77.157 ms | 28.19 MiB | 28.26 MiB |
+| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 78.760 ms | 11.59 MiB | 11.64 MiB |
+| Larger stress | `torch_backward` | n/a | n/a | 8.309 ms | 16.00 KiB | 20.00 KiB |
