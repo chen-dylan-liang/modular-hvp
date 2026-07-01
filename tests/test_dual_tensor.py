@@ -195,6 +195,28 @@ def test_mse_loss_matches_finite_difference() -> None:
     assert torch.allclose(tangent(output), fd, rtol=1e-6, atol=1e-6)
 
 
+def test_reverse_scalar_and_matmul_rules() -> None:
+    x = torch.tensor([2.0, 4.0], dtype=torch.float64)
+    x_dot = torch.tensor([0.5, -1.0], dtype=torch.float64)
+    dual = make_dual(x, x_dot)
+
+    rsub = 3.0 - dual
+    assert torch.allclose(primal(rsub), 3.0 - x)
+    assert torch.allclose(tangent(rsub), -x_dot)
+
+    rdiv = 3.0 / dual
+    assert torch.allclose(primal(rdiv), 3.0 / x)
+    assert torch.allclose(tangent(rdiv), -(3.0 * x_dot) / x.pow(2))
+
+    left = torch.randn(2, 3, dtype=torch.float64)
+    right = torch.randn(3, 4, dtype=torch.float64)
+    right_dot = torch.randn_like(right)
+    output = left @ make_dual(right, right_dot)
+
+    assert torch.allclose(primal(output), left @ right)
+    assert torch.allclose(tangent(output), left @ right_dot)
+
+
 def test_unpack_dual_and_unsupported_ops() -> None:
     x = torch.randn(3, dtype=torch.float64)
     x_dot = torch.randn_like(x)

@@ -15,7 +15,6 @@ class DualTensor(torch.Tensor):
     """Tensor wrapper representing ``primal + eps * tangent``."""
 
     __slots__ = ("_primal", "_tangent")
-    __torch_function__ = torch._C._disabled_torch_function_impl
 
     @staticmethod
     def __new__(cls, primal: torch.Tensor, tangent: torch.Tensor) -> "DualTensor":
@@ -36,6 +35,24 @@ class DualTensor(torch.Tensor):
         _validate_dual_parts(primal, tangent)
         self._primal = primal
         self._tangent = tangent
+
+    @classmethod
+    def __torch_function__(
+        cls,
+        func: Any,
+        types: tuple[type, ...],
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        if kwargs is None:
+            kwargs = {}
+        if _has_out_argument(kwargs):
+            raise NotImplementedError(f"DualTensor rule not implemented for {func}")
+        rule = _TORCH_FUNCTION_RULES.get(_function_name(func))
+        if rule is None:
+            raise NotImplementedError(f"DualTensor rule not implemented for {func}")
+        with torch._C.DisableTorchFunctionSubclass():
+            return rule(func, args, kwargs)
 
     @classmethod
     def __torch_dispatch__(
@@ -128,6 +145,7 @@ def run_with_dual_parameter(
 
 Rule = Callable[[Any, tuple[Any, ...], dict[str, Any]], Any]
 _RULES: dict[Any, Rule] = {}
+_TORCH_FUNCTION_RULES: dict[str, Rule] = {}
 
 
 def _validate_dual_parts(primal_value: torch.Tensor, tangent_value: torch.Tensor) -> None:
@@ -163,6 +181,10 @@ def _has_out_argument(kwargs: dict[str, Any]) -> bool:
     if isinstance(out, tuple):
         return any(item is not None for item in out)
     return True
+
+
+def _function_name(func: Any) -> str:
+    return getattr(func, "__name__", repr(func))
 
 
 def _tree_map(fn: Callable[[Any], Any], value: Any) -> Any:
@@ -208,6 +230,15 @@ def _add_terms(*terms: Any) -> Any:
 def _wrap(primal_output: Any, tangent_output: Any) -> Any:
     if not isinstance(primal_output, torch.Tensor):
         return primal_output
+    return _make_rule_output(primal_output, tangent_output)
+
+
+def _make_rule_output(
+    primal_output: torch.Tensor,
+    tangent_output: torch.Tensor,
+) -> DualTensor:
+    if tangent_output.shape != primal_output.shape:
+        tangent_output = tangent_output + torch.zeros_like(primal_output)
     return make_dual(primal_output, tangent_output)
 
 
@@ -235,7 +266,7 @@ def _add_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualT
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
-    return make_dual(primal_output, tangent_output)
+    return _make_rule_output(primal_output, tangent_output)
 
 
 def _sub_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
@@ -251,13 +282,27 @@ def _sub_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualT
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
-    return make_dual(primal_output, tangent_output)
+    return _make_rule_output(primal_output, tangent_output)
+
+
+def _rsub_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
+    right, left = args[:2]
+    right_p, right_t, right_is_dual = _split(right)
+    left_p, left_t, left_is_dual = _split(left)
+    primal_output = func(right_p, left_p, **kwargs)
+    tangent_output = _add_terms(
+        left_t if left_is_dual else None,
+        -right_t if right_is_dual else None,
+    )
+    if tangent_output is None:
+        tangent_output = _zero_like(primal_output)
+    return _make_rule_output(primal_output, tangent_output)
 
 
 def _neg_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
     value = args[0]
     value_p, value_t, _ = _split(value)
-    return make_dual(func(value_p, **kwargs), -value_t)
+    return _make_rule_output(func(value_p, **kwargs), -value_t)
 
 
 def _mul_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
@@ -272,7 +317,7 @@ def _mul_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualT
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
-    return make_dual(primal_output, tangent_output)
+    return _make_rule_output(primal_output, tangent_output)
 
 
 def _div_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
@@ -287,7 +332,23 @@ def _div_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualT
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
-    return make_dual(primal_output, tangent_output)
+    return _make_rule_output(primal_output, tangent_output)
+
+
+def _rdiv_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
+    denominator, numerator = args[:2]
+    denominator_p, denominator_t, denominator_is_dual = _split(denominator)
+    numerator_p, numerator_t, numerator_is_dual = _split(numerator)
+    primal_output = func(denominator_p, numerator_p, **kwargs)
+    tangent_output = _add_terms(
+        numerator_t / denominator_p if numerator_is_dual else None,
+        -(numerator_p * denominator_t) / (denominator_p * denominator_p)
+        if denominator_is_dual
+        else None,
+    )
+    if tangent_output is None:
+        tangent_output = _zero_like(primal_output)
+    return _make_rule_output(primal_output, tangent_output)
 
 
 def _pow_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
@@ -304,7 +365,7 @@ def _pow_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualT
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
-    return make_dual(primal_output, tangent_output)
+    return _make_rule_output(primal_output, tangent_output)
 
 
 def _scalar_pow_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
@@ -315,7 +376,7 @@ def _scalar_pow_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -
         tangent_output = _zero_like(primal_output)
     else:
         tangent_output = primal_output * math.log(base) * exponent_t
-    return make_dual(primal_output, tangent_output)
+    return _make_rule_output(primal_output, tangent_output)
 
 
 def _matmul_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
@@ -329,7 +390,21 @@ def _matmul_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Du
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
-    return make_dual(primal_output, tangent_output)
+    return _make_rule_output(primal_output, tangent_output)
+
+
+def _rmatmul_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
+    right, left = args[:2]
+    right_p, right_t, right_is_dual = _split(right)
+    left_p, left_t, left_is_dual = _split(left)
+    primal_output = func(right_p, left_p, **kwargs)
+    tangent_output = _add_terms(
+        left_t @ right_p if left_is_dual else None,
+        left_p @ right_t if right_is_dual else None,
+    )
+    if tangent_output is None:
+        tangent_output = _zero_like(primal_output)
+    return _make_rule_output(primal_output, tangent_output)
 
 
 def _addmm_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
@@ -347,7 +422,7 @@ def _addmm_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Dua
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
-    return make_dual(primal_output, tangent_output)
+    return _make_rule_output(primal_output, tangent_output)
 
 
 def _linear_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
@@ -365,14 +440,14 @@ def _linear_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Du
     )
     if tangent_output is None:
         tangent_output = _zero_like(primal_output)
-    return make_dual(primal_output, tangent_output)
+    return _make_rule_output(primal_output, tangent_output)
 
 
 def _reduction_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
     value = args[0]
     value_p, value_t, _ = _split(value)
     other_args = args[1:]
-    return make_dual(
+    return _make_rule_output(
         func(value_p, *other_args, **kwargs),
         func(value_t, *other_args, **kwargs),
     )
@@ -383,7 +458,7 @@ def _relu_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Dual
     value_p, value_t, _ = _split(value)
     primal_output = func(value_p, **kwargs)
     tangent_output = torch.where(value_p > 0, value_t, torch.zeros_like(value_t))
-    return make_dual(primal_output, tangent_output)
+    return _make_rule_output(primal_output, tangent_output)
 
 
 def _gelu_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
@@ -404,7 +479,7 @@ def _gelu_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Dual
         normal_pdf = torch.exp(-0.5 * value_p.pow(2)) / math.sqrt(2.0 * math.pi)
         derivative = normal_cdf + value_p * normal_pdf
 
-    return make_dual(primal_output, derivative * value_t)
+    return _make_rule_output(primal_output, derivative * value_t)
 
 
 def _threshold_backward_rule(
@@ -419,7 +494,7 @@ def _threshold_backward_rule(
         if grad_is_dual
         else torch.zeros_like(primal_output)
     )
-    return make_dual(primal_output, tangent_output)
+    return _make_rule_output(primal_output, tangent_output)
 
 
 def _mse_loss_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
@@ -450,7 +525,7 @@ def _mse_loss_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> 
         tangent_output = tangent_unreduced.sum()
     else:
         raise ValueError(f"unknown mse_loss reduction: {reduction!r}")
-    return make_dual(primal_output, tangent_output)
+    return _make_rule_output(primal_output, tangent_output)
 
 
 def _comparison_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
@@ -471,7 +546,7 @@ def _where_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any
         left_t if left_is_dual else _zero_like(left_p),
         right_t if right_is_dual else _zero_like(right_p),
     )
-    return make_dual(primal_output, tangent_output)
+    return _make_rule_output(primal_output, tangent_output)
 
 
 def _register(name: str, overload: str, rule: Rule) -> None:
@@ -479,6 +554,57 @@ def _register(name: str, overload: str, rule: Rule) -> None:
     if packet is None or overload not in packet.overloads():
         return
     _RULES[getattr(packet, overload)] = rule
+
+
+def _register_torch_function(names: tuple[str, ...], rule: Rule) -> None:
+    for name in names:
+        _TORCH_FUNCTION_RULES[name] = rule
+
+
+_register_torch_function(("add", "__add__", "__radd__"), _add_rule)
+_register_torch_function(("sub", "__sub__"), _sub_rule)
+_register_torch_function(("__rsub__",), _rsub_rule)
+_register_torch_function(("neg", "__neg__"), _neg_rule)
+_register_torch_function(("mul", "__mul__", "__rmul__"), _mul_rule)
+_register_torch_function(("div", "divide", "__truediv__"), _div_rule)
+_register_torch_function(("__rtruediv__", "__rdiv__"), _rdiv_rule)
+_register_torch_function(("pow", "__pow__"), _pow_rule)
+_register_torch_function(("__rpow__",), _scalar_pow_rule)
+_register_torch_function(("mm", "matmul", "__matmul__"), _matmul_rule)
+_register_torch_function(("__rmatmul__",), _rmatmul_rule)
+_register_torch_function(("bmm",), _matmul_rule)
+_register_torch_function(("addmm",), _addmm_rule)
+_register_torch_function(("linear",), _linear_rule)
+_register_torch_function(("sum", "mean"), _reduction_rule)
+_register_torch_function(
+    (
+        "view",
+        "reshape",
+        "_unsafe_view",
+        "flatten",
+        "transpose",
+        "t",
+        "permute",
+        "squeeze",
+        "unsqueeze",
+        "expand",
+        "contiguous",
+        "clone",
+        "to",
+        "_to_copy",
+        "detach",
+    ),
+    _apply_same_unary_rule,
+)
+_register_torch_function(("relu",), _relu_rule)
+_register_torch_function(("threshold_backward",), _threshold_backward_rule)
+_register_torch_function(("gelu",), _gelu_rule)
+_register_torch_function(("mse_loss",), _mse_loss_rule)
+_register_torch_function(
+    ("gt", "ge", "lt", "le", "eq", "ne", "__gt__", "__ge__", "__lt__", "__le__", "__eq__", "__ne__"),
+    _comparison_rule,
+)
+_register_torch_function(("where",), _where_rule)
 
 
 for _name, _overload in (

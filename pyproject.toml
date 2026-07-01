@@ -15,11 +15,16 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=7.4"]
+dev = [
+    "backpack-for-pytorch>=1.7.1",
+    "numpy<2",
+    "psutil>=7.2.2",
+    "pytest>=7.4",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]

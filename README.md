@@ -38,3 +38,16 @@ tangent(y_hat)
 
 This layer overloads selected ATen primitives and raises `NotImplementedError`
 when a `DualTensor` reaches an unsupported operation.
+
+## Toy MLP Comparison
+
+The BackPACK comparison script checks per-parameter block HVPs on a small MLP
+against BackPACK HMP and BackPACK's reverse-over-reverse HVP utility:
+
+```bash
+uv run python benchmarks/compare_toy_mlp.py
+```
+
+The script reports max absolute/relative error against the ModularHVP
+DualTensor path plus wall-clock time, sampled RSS delta, Python allocation
+peak, and CUDA allocation peak when running on CUDA.
