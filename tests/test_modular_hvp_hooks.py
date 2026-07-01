@@ -7,7 +7,7 @@ import pytest
 import torch
 from torch import nn
 
-from modular_hvp import BlockDualTensor, FakeDualBackend, LocalDualActivations, modular_hvp
+from modular_hvp import FakeDualBackend, LocalDualActivations, modular_hvp
 
 
 def _tangents_by_name(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -135,7 +135,7 @@ def test_default_modular_hvp_matches_block_autodiff_on_mlp() -> None:
         loss = criterion(model(x), target)
         loss.backward()
 
-    assert torch.allclose(loss.primal.detach(), baseline_loss.detach())
+    assert torch.allclose(loss.detach(), baseline_loss.detach())
     for (_, expected), (_, actual) in zip(
         baseline.named_parameters(), model.named_parameters(), strict=True
     ):
@@ -174,15 +174,16 @@ def test_explicit_hook_backend_preserves_primal_forward_and_gradients() -> None:
     assert backend.backward_modules == ["Linear", "Linear"]
 
 
-def test_default_context_restores_parameters_and_removes_active_flags() -> None:
+def test_default_context_restores_forward_and_removes_active_flags() -> None:
     model = nn.Linear(3, 2)
-    original_weight = model.weight
+    original_forward = model.forward
 
     with modular_hvp(model, _tangents_by_name(model)):
-        assert isinstance(model._parameters["weight"], BlockDualTensor)
+        assert model.forward is not original_forward
 
-    assert model.weight is original_weight
-    assert not hasattr(model, "_modular_hvp_block_dual_active")
+    assert "forward" not in model.__dict__
+    assert not hasattr(model, "_modular_hvp_local_mlp_active")
+    assert model.forward.__func__ is original_forward.__func__
 
 
 def test_explicit_hook_context_restores_forward_and_removes_active_flags() -> None:
@@ -206,7 +207,9 @@ def test_parameter_object_tangent_keys_are_supported() -> None:
     }
 
     with modular_hvp(model, tangents):
-        loss = model(torch.randn(4, 3)).pow(2).mean()
+        output = model(torch.randn(4, 3))
+        assert type(output) is torch.Tensor
+        loss = nn.MSELoss()(output, torch.zeros_like(output))
         loss.backward()
 
     for parameter in model.parameters():
@@ -269,7 +272,9 @@ def test_existing_stale_hvp_is_cleared_on_entry() -> None:
     model.weight.hvp = torch.full_like(model.weight, 17.0)
 
     with modular_hvp(model, _tangents_by_name(model)):
-        model(torch.randn(4, 3)).pow(2).mean().backward()
+        output = model(torch.randn(4, 3))
+        assert type(output) is torch.Tensor
+        nn.MSELoss()(output, torch.zeros_like(output)).backward()
 
     assert model.weight.hvp is not None
     assert not torch.equal(model.weight.hvp, torch.full_like(model.weight, 17.0))

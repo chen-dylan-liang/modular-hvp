@@ -2,7 +2,6 @@
 
 from modular_hvp.api import modular_hvp
 from modular_hvp.backend import FakeDualBackend, LocalDualActivations
-from modular_hvp.block_dual import BlockDualTensor
 from modular_hvp.dual import (
     DualTensor,
     is_dual,
@@ -15,7 +14,6 @@ from modular_hvp.dual import (
 
 __all__ = [
     "DualTensor",
-    "BlockDualTensor",
     "FakeDualBackend",
     "LocalDualActivations",
     "is_dual",

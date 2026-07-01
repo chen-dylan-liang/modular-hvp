@@ -8,8 +8,8 @@ from typing import Any
 import torch
 from torch import nn
 
-from modular_hvp.block_dual import BlockDualHVPRuntime
 from modular_hvp.backend import DualBackend, FakeDualBackend
+from modular_hvp.local_mlp import LocalMLPHVPRuntime
 from modular_hvp.runtime import ModularHVPRuntime
 
 
@@ -32,7 +32,8 @@ def modular_hvp(
         parameter.
     backend:
         Internal extension point for the hook-plumbing runtime. When omitted,
-        the integrated block-dual runtime computes per-parameter HVPs.
+        the local MLP runtime computes per-parameter HVPs for the currently
+        supported Linear/ReLU/MSE scope.
     """
 
     if not isinstance(model, nn.Module):
@@ -42,4 +43,4 @@ def modular_hvp(
 
     if backend is not None:
         return ModularHVPRuntime(model=model, tangents=v, backend=backend)
-    return BlockDualHVPRuntime(model=model, tangents=v)
+    return LocalMLPHVPRuntime(model=model, tangents=v)
