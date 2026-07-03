@@ -142,3 +142,39 @@ created with `requires_grad=True`.
 | Deep stress 50-layer | `backpack_hmp` | 7.451e-09 | 1.206e-06 | 14258.464 ms | 906.65 MiB | 936.36 MiB | 1.11 GiB |
 | Deep stress 50-layer | `backpack_autodiff` | 7.451e-09 | 7.954e-07 | 14908.764 ms | 433.74 MiB | 478.16 MiB | 478.46 MiB |
 | Deep stress 50-layer | `torch_backward` | n/a | n/a | 97.658 ms | 302.61 MiB | 327.02 MiB | 327.31 MiB |
+
+## Depth Sweep
+
+The depth sweep fixes width at 256 and compares the three HVP methods across
+10, 25, 50, 75, and 100 hidden Linear/ReLU blocks:
+
+```bash
+uv run python benchmarks/depth_sweep_mlp.py \
+  --depths 10 25 50 75 100 \
+  --batch-size 256 --d-in 784 --d-hidden 256 --d-out 10 \
+  --dtype float32 --warmup 1 --repeats 3
+```
+
+The script writes the raw data to
+`benchmarks/results/depth_sweep_width256.json` and the trend figure to
+`benchmarks/results/depth_sweep_width256.png`.
+
+![Width-256 MLP depth sweep](benchmarks/results/depth_sweep_width256.png)
+
+| Depth | Method | Max abs error | Max rel error | Mean time | Median avg RSS | Median peak RSS |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 10 | `modular_hvp` | 0.000e+00 | 0.000e+00 | 0.122 s | 210.91 MiB | 215.27 MiB |
+| 10 | `backpack_hmp` | 3.725e-09 | 7.478e-07 | 0.172 s | 256.96 MiB | 262.74 MiB |
+| 10 | `backpack_autodiff` | 3.725e-09 | 8.012e-07 | 0.149 s | 258.97 MiB | 266.88 MiB |
+| 25 | `modular_hvp` | 0.000e+00 | 0.000e+00 | 0.743 s | 233.85 MiB | 246.14 MiB |
+| 25 | `backpack_hmp` | 1.490e-08 | 1.122e-06 | 1.053 s | 337.60 MiB | 351.11 MiB |
+| 25 | `backpack_autodiff` | 1.490e-08 | 1.122e-06 | 0.987 s | 279.00 MiB | 297.67 MiB |
+| 50 | `modular_hvp` | 0.000e+00 | 0.000e+00 | 3.786 s | 275.30 MiB | 298.59 MiB |
+| 50 | `backpack_hmp` | 1.490e-08 | 8.969e-07 | 5.628 s | 477.61 MiB | 499.40 MiB |
+| 50 | `backpack_autodiff` | 1.490e-08 | 8.969e-07 | 5.295 s | 320.11 MiB | 349.87 MiB |
+| 75 | `modular_hvp` | 0.000e+00 | 0.000e+00 | 16.721 s | 319.03 MiB | 349.80 MiB |
+| 75 | `backpack_hmp` | 5.588e-09 | 1.006e-06 | 24.026 s | 445.45 MiB | 529.23 MiB |
+| 75 | `backpack_autodiff` | 5.588e-09 | 1.006e-06 | 24.802 s | 364.70 MiB | 401.50 MiB |
+| 100 | `modular_hvp` | 0.000e+00 | 0.000e+00 | 37.764 s | 365.11 MiB | 403.32 MiB |
+| 100 | `backpack_hmp` | 2.980e-08 | 9.094e-07 | 47.471 s | 750.78 MiB | 794.26 MiB |
+| 100 | `backpack_autodiff` | 2.980e-08 | 9.094e-07 | 61.244 s | 393.50 MiB | 454.02 MiB |
