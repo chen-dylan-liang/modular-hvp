@@ -11,10 +11,9 @@ from torch import nn
 from torch.nn import functional as F
 
 from modular_hvp.dual import (
+    TangentPayload,
     _extract_tangent,
     _make_multi_dual,
-    _make_zero_dual,
-    _tangent_eval_only,
     make_dual,
     primal,
     tangent,
@@ -26,12 +25,16 @@ from modular_hvp.runtime import ParameterBlock, _resolve_parameter_blocks
 class LinearForwardRecord:
     module: nn.Linear
     input_primal: torch.Tensor
+    input_id: int
+    output_id: int
     local_dual_activations: dict[nn.Parameter, torch.Tensor]
 
 
 @dataclass(frozen=True, slots=True)
 class ReLUForwardRecord:
     input_primal: torch.Tensor
+    input_id: int
+    output_id: int
 
 
 ForwardRecord = LinearForwardRecord | ReLUForwardRecord
@@ -67,6 +70,9 @@ class RuntimeState:
     primal_loss: torch.Tensor | None = None
     backward_called: bool = False
     output_id: int | None = None
+    output_tangent: TangentPayload | None = None
+    grad_tangents_by_tensor_id: dict[int, TangentPayload] = field(default_factory=dict)
+    eager_backward_active: bool = False
 
 
 class LocalMLPHVPRuntime:
@@ -132,6 +138,9 @@ class LocalMLPHVPRuntime:
         self._state.loss_record = None
         self._state.primal_loss = None
         self._state.output_id = None
+        self._state.output_tangent = None
+        self._state.grad_tangents_by_tensor_id.clear()
+        self._state.eager_backward_active = False
         return None
 
     def record_mse_loss(
@@ -164,15 +173,20 @@ class LocalMLPHVPRuntime:
         primal_loss.register_hook(self._make_loss_hook())
         return primal_loss
 
-    def compute_hvps_once(self) -> None:
-        if self._state.backward_called:
-            return
-        self._state.backward_called = True
-        self._compute_hvps()
-
     def _clear_hvp_slots(self) -> None:
         for block in self.parameter_blocks:
             setattr(block.parameter, "hvp", None)
+
+    def _initialize_hvp_accumulators(self) -> None:
+        for block in self.parameter_blocks:
+            setattr(
+                block.parameter,
+                "hvp",
+                torch.zeros_like(
+                    block.parameter,
+                    memory_format=torch.preserve_format,
+                ),
+            )
 
     def _install_forward_wrapper(self) -> None:
         original_forward = self.model.forward
@@ -249,7 +263,11 @@ class LocalMLPHVPRuntime:
 
         self._state.records.clear()
         self._state.output_id = None
-        output = args[0]
+        self._state.output_tangent = None
+        self._state.grad_tangents_by_tensor_id.clear()
+        self._state.backward_called = False
+        self._state.eager_backward_active = False
+        output: Any = args[0]
         for module in _iter_supported_modules(self.model):
             if isinstance(module, nn.Linear):
                 output = self._run_linear_forward(module, output)
@@ -259,15 +277,19 @@ class LocalMLPHVPRuntime:
                 raise NotImplementedError(
                     f"unsupported module in Sequential MLP: {module.__class__.__name__}"
                 )
-        self._state.output_id = id(output)
-        return output
+        output_primal = primal(output)
+        self._state.output_id = id(output_primal)
+        self._state.output_tangent = tangent(output)
+        return output_primal
 
     def _run_linear_forward(
         self,
         module: nn.Linear,
-        input_value: torch.Tensor,
-    ) -> torch.Tensor:
-        input_primal = input_value.detach()
+        input_value: Any,
+    ) -> Any:
+        input_primal_live = primal(input_value)
+        input_primal = input_primal_live.detach()
+        input_id = id(input_primal_live)
         local_duals: dict[nn.Parameter, torch.Tensor] = {}
         dual_parameters: dict[str, torch.Tensor] = {}
 
@@ -301,28 +323,42 @@ class LocalMLPHVPRuntime:
                         parameter,
                     ).detach()
         else:
-            output = self._call_module_forward(module, input_value)
+            output_hat = self._call_module_forward(module, input_value)
+            output = primal(output_hat)
 
-        self._state.records.append(
-            LinearForwardRecord(
-                module=module,
-                input_primal=input_primal,
-                local_dual_activations=local_duals,
-            )
+        output_id = id(output)
+        record = LinearForwardRecord(
+            module=module,
+            input_primal=input_primal,
+            input_id=input_id,
+            output_id=output_id,
+            local_dual_activations=local_duals,
         )
-        return output
+        self._state.records.append(record)
+        if output.requires_grad:
+            output.register_hook(self._make_forward_record_hook(record))
+        return output_hat
 
     def _run_relu_forward(
         self,
         module: nn.ReLU,
-        input_value: torch.Tensor,
-    ) -> torch.Tensor:
+        input_value: Any,
+    ) -> Any:
         if module.inplace:
             raise NotImplementedError("LocalMLPHVPRuntime does not support inplace ReLU")
-        input_primal = input_value.detach()
-        output = self._call_module_forward(module, input_value)
-        self._state.records.append(ReLUForwardRecord(input_primal=input_primal))
-        return output
+        input_primal_live = primal(input_value)
+        input_primal = input_primal_live.detach()
+        output_hat = self._call_module_forward(module, input_value)
+        output = primal(output_hat)
+        record = ReLUForwardRecord(
+            input_primal=input_primal,
+            input_id=id(input_primal_live),
+            output_id=id(output),
+        )
+        self._state.records.append(record)
+        if output.requires_grad:
+            output.register_hook(self._make_forward_record_hook(record))
+        return output_hat
 
     def _call_module_forward(
         self,
@@ -363,7 +399,7 @@ class LocalMLPHVPRuntime:
                 parameters.append(module.bias)
         return tuple(parameters)
 
-    def _compute_hvps(self) -> None:
+    def _start_eager_backward(self, grad: torch.Tensor) -> None:
         loss_record = self._state.loss_record
         if loss_record is None:
             raise RuntimeError(
@@ -374,113 +410,128 @@ class LocalMLPHVPRuntime:
             self._compute_reused_parameter_hvps_autodiff()
             return
 
-        loss_input_primal = loss_record.input_primal
-        loss_target_primal = loss_record.target_primal
-        loss_reduction = loss_record.reduction
-
-        def curvature_apply(
-            vector: torch.Tensor,
-            *,
-            loss_input_primal: torch.Tensor = loss_input_primal,
-            loss_target_primal: torch.Tensor = loss_target_primal,
-            loss_reduction: str = loss_reduction,
-        ) -> torch.Tensor:
-            gradient_hat = _mse_input_backward_program(
-                make_dual(loss_input_primal, vector),
-                loss_target_primal,
-                loss_input_primal.new_ones(()),
-                loss_reduction,
-            )
-            return tangent(gradient_hat)
-
-        hvps: dict[nn.Parameter, torch.Tensor] = {}
         with torch.no_grad():
-            with _tangent_eval_only():
-                for record in reversed(self._state.records):
-                    if isinstance(record, ReLUForwardRecord):
-                        previous_curvature_apply = curvature_apply
-                        input_primal = record.input_primal
+            self._initialize_hvp_accumulators()
+            output_id = self._state.output_id
+            output_tangent = self._state.output_tangent
+            if output_id is None or output_tangent is None:
+                raise RuntimeError("missing saved model-output tangent")
+            scale = _mse_hessian_scale(loss_record)
+            grad_scale = grad.detach()
+            output_grad_tangent = _map_tangent_payload(
+                lambda item: grad_scale * scale * item,
+                output_tangent,
+            )
+            self._state.grad_tangents_by_tensor_id[output_id] = output_grad_tangent
+            self._state.eager_backward_active = True
 
-                        def relu_curvature_apply(
-                            vector: torch.Tensor,
-                            *,
-                            input_primal: torch.Tensor = input_primal,
-                            previous_curvature_apply: Any = previous_curvature_apply,
-                        ) -> torch.Tensor:
-                            output_tangent = tangent(
-                                torch.ops.aten.relu.default(
-                                    make_dual(input_primal, vector)
-                                )
-                            )
-                            output_curvature = previous_curvature_apply(output_tangent)
-                            input_curvature_hat = _relu_backward_program(
-                                input_primal,
-                                _make_zero_dual(output_curvature),
-                            )
-                            return tangent(input_curvature_hat)
-
-                        curvature_apply = relu_curvature_apply
-                        continue
-
-                    input_primal = record.input_primal
-                    for parameter, local_dual in record.local_dual_activations.items():
-                        curved_dual = curvature_apply(local_dual)
-                        grad_output_hat = _make_zero_dual(curved_dual)
-                        _, grad_weight_hat, grad_bias_hat = _linear_backward_program(
-                            input_primal,
-                            record.module.weight.detach(),
-                            grad_output_hat,
-                        )
-                        if parameter is record.module.weight:
-                            hvp = tangent(grad_weight_hat)
-                        elif parameter is record.module.bias:
-                            hvp = tangent(grad_bias_hat)
-                        else:
-                            raise RuntimeError(
-                                "local dual activation belongs to wrong module"
-                            )
-                        existing_hvp = hvps.get(parameter)
-                        hvps[parameter] = (
-                            hvp if existing_hvp is None else existing_hvp + hvp
-                        )
-
-                    previous_curvature_apply = curvature_apply
-                    weight = record.module.weight.detach()
-
-                    def linear_curvature_apply(
-                        vector: torch.Tensor,
-                        *,
-                        weight: torch.Tensor = weight,
-                        previous_curvature_apply: Any = previous_curvature_apply,
-                    ) -> torch.Tensor:
-                        output_tangent = tangent(
-                            _linear_forward_program(
-                                _make_zero_dual(vector),
-                                weight,
-                                None,
-                            )
-                        )
-                        output_curvature = previous_curvature_apply(output_tangent)
-                        input_curvature_hat = _linear_input_backward_program(
-                            weight,
-                            _make_zero_dual(output_curvature),
-                        )
-                        return tangent(input_curvature_hat)
-
-                    curvature_apply = linear_curvature_apply
-
-            for block in self.parameter_blocks:
-                hvp = hvps.get(block.parameter)
-                if hvp is None:
-                    hvp = torch.zeros_like(
-                        block.parameter,
-                        memory_format=torch.preserve_format,
+    def _make_forward_record_hook(self, record: ForwardRecord) -> Any:
+        def forward_record_hook(grad: torch.Tensor) -> torch.Tensor:
+            if not self._state.eager_backward_active:
+                return grad
+            grad_tangent = self._state.grad_tangents_by_tensor_id.pop(
+                record.output_id,
+                None,
+            )
+            if grad_tangent is None:
+                return grad
+            with torch.no_grad():
+                if isinstance(record, LinearForwardRecord):
+                    self._consume_linear_backward_record(
+                        record=record,
+                        grad=grad,
+                        grad_tangent=grad_tangent,
                     )
-                setattr(block.parameter, "hvp", hvp.detach())
+                else:
+                    self._consume_relu_backward_record(
+                        record=record,
+                        grad=grad,
+                        grad_tangent=grad_tangent,
+                    )
+            return grad
+
+        return forward_record_hook
+
+    def _consume_linear_backward_record(
+        self,
+        *,
+        record: LinearForwardRecord,
+        grad: torch.Tensor,
+        grad_tangent: TangentPayload,
+    ) -> None:
+        local_parameters = set(record.local_dual_activations)
+        for parameter in record.local_dual_activations:
+            parameter_grad_tangent = _extract_tangent(grad_tangent, parameter)
+            if parameter is record.module.weight:
+                hvp = torch.ops.aten.mm.default(
+                    torch.ops.aten.t.default(parameter_grad_tangent),
+                    record.input_primal,
+                )
+            elif parameter is record.module.bias:
+                hvp = torch.ops.aten.sum.dim_IntList(
+                    parameter_grad_tangent,
+                    [0],
+                    False,
+                )
+            else:
+                raise RuntimeError("local dual activation belongs to wrong module")
+            self._accumulate_hvp(parameter, hvp)
+
+        upstream_tangent = _drop_tangent_payload_keys(
+            grad_tangent,
+            local_parameters,
+        )
+        if upstream_tangent is None:
+            return
+        grad_output_hat = _make_dual_payload(torch.zeros_like(grad), upstream_tangent)
+        input_tangent_hat = _linear_input_backward_program(
+            record.module.weight.detach(),
+            grad_output_hat,
+        )
+        self._accumulate_grad_tangent(
+            record.input_id,
+            tangent(input_tangent_hat),
+        )
+
+    def _consume_relu_backward_record(
+        self,
+        *,
+        record: ReLUForwardRecord,
+        grad: torch.Tensor,
+        grad_tangent: TangentPayload,
+    ) -> None:
+        grad_output_hat = _make_dual_payload(torch.zeros_like(grad), grad_tangent)
+        input_tangent_hat = _relu_backward_program(record.input_primal, grad_output_hat)
+        self._accumulate_grad_tangent(record.input_id, tangent(input_tangent_hat))
+
+    def _accumulate_grad_tangent(
+        self,
+        tensor_id: int,
+        grad_tangent: TangentPayload | None,
+    ) -> None:
+        if grad_tangent is None:
+            return
+        existing = self._state.grad_tangents_by_tensor_id.get(tensor_id)
+        if existing is None:
+            self._state.grad_tangents_by_tensor_id[tensor_id] = grad_tangent
+        else:
+            self._state.grad_tangents_by_tensor_id[tensor_id] = _add_tangent_payloads(
+                existing,
+                grad_tangent,
+            )
+
+    def _accumulate_hvp(self, parameter: nn.Parameter, hvp: torch.Tensor) -> None:
+        existing = getattr(parameter, "hvp", None)
+        if existing is None:
+            setattr(parameter, "hvp", hvp.detach())
+        else:
+            existing.add_(hvp)
 
     def _make_loss_hook(self) -> Any:
         def loss_hook(grad: torch.Tensor) -> torch.Tensor:
-            self.compute_hvps_once()
+            if not self._state.backward_called:
+                self._state.backward_called = True
+                self._start_eager_backward(grad)
             return grad
 
         return loss_hook
@@ -607,6 +658,64 @@ def _parameter_use_counts(model: nn.Module) -> dict[nn.Parameter, int]:
 
 def _primal(value: Any) -> Any:
     return value
+
+
+def _mse_hessian_scale(record: MSELossRecord) -> torch.Tensor:
+    if record.reduction == "mean":
+        return record.input_primal.new_tensor(2.0 / record.input_primal.numel())
+    if record.reduction == "sum":
+        return record.input_primal.new_tensor(2.0)
+    raise ValueError(f"unknown mse_loss reduction: {record.reduction!r}")
+
+
+def _make_dual_payload(
+    primal_value: torch.Tensor,
+    payload: TangentPayload,
+) -> torch.Tensor:
+    if isinstance(payload, dict):
+        return _make_multi_dual(primal_value, payload)
+    return make_dual(primal_value, payload)
+
+
+def _map_tangent_payload(
+    fn: Callable[[torch.Tensor], torch.Tensor],
+    payload: TangentPayload,
+) -> TangentPayload:
+    if isinstance(payload, dict):
+        return {key: fn(value) for key, value in payload.items()}
+    return fn(payload)
+
+
+def _add_tangent_payloads(
+    left: TangentPayload,
+    right: TangentPayload,
+) -> TangentPayload:
+    if isinstance(left, dict) or isinstance(right, dict):
+        if not isinstance(left, dict):
+            left = {key: torch.zeros_like(value) for key, value in right.items()}
+        if not isinstance(right, dict):
+            right = {key: torch.zeros_like(value) for key, value in left.items()}
+        keys = left.keys() | right.keys()
+        output: dict[object, torch.Tensor] = {}
+        for key in keys:
+            if key in left and key in right:
+                output[key] = left[key] + right[key]
+            elif key in left:
+                output[key] = left[key]
+            else:
+                output[key] = right[key]
+        return output
+    return left + right
+
+
+def _drop_tangent_payload_keys(
+    payload: TangentPayload,
+    keys: set[nn.Parameter],
+) -> TangentPayload | None:
+    if not isinstance(payload, dict):
+        return None if keys else payload
+    output = {key: value for key, value in payload.items() if key not in keys}
+    return output or None
 
 
 def _normalize_backward_kwargs(

@@ -28,12 +28,13 @@ Current implementation status:
 - `DualTensor.primal` preserves ordinary PyTorch autograd graph construction.
   `DualTensor.tangent` is detached at construction and every primitive tangent
   rule runs as a no-grad side channel using detached primal values.
-- The runtime keeps the public forward path ordinary at module boundaries. When
-  a module owns active parameter blocks, the runtime calls that module's
-  original `forward` once with those parameters temporarily replaced by
-  block-keyed `DualTensor`s. Primitive rules produce both the primal output and
-  per-parameter local dual activations; only the primal output is passed to the
-  next module.
+- The runtime keeps the user-visible forward path ordinary. Internally, it uses
+  a keyed side-channel of `DualTensor` tangents: each parameter block has its
+  own key, keys are never summed into a global tangent, and only primal tensors
+  are returned to user code.
+- During backward, tensor hooks at saved activation boundaries consume the
+  keyed side-channel as PyTorch's ordinary backward reaches that block. HVPs are
+  written into the single public `p.hvp` field during that same backward pass.
 - The generic hook-plumbing runtime remains available as an internal extension
   point for future optimized dualized-backward integration.
 
@@ -93,15 +94,15 @@ timed region. The measured region contains the forward pass, BackPACK HMP
 backward pass, and one `param.hmp(...)` application per parameter.
 
 The current `modular_hvp` implementation is correct on these MLP benchmarks,
-and follows the per-parameter locality rules: each parameter tangent is consumed
-inside its owning Linear forward, the normal model receives only the primal
-activation, and the saved local dual activation is consumed later to write the
-single public `p.hvp`. Reused parameters accumulate into that same `p.hvp`; the
-current shared-parameter path uses a correctness fallback.
+and follows the block-scoped invariant: each parameter tangent is keyed to its
+own parameter block, never summed with neighboring blocks, and contributes only
+to that parameter's public `p.hvp`. Reused parameters accumulate into that same
+`p.hvp`; the current shared-parameter path uses a correctness fallback.
 
-The local runtime does not stack independent parameter epsilons into a global or
-multi-channel tangent. Each saved local dual activation is consumed separately
-for its owning parameter block.
+The local runtime does not compute a full HVP and slice it. It uses a
+block-keyed side-channel so different parameter epsilons can pass through the
+same primitive tensor program without being combined into one model-wide
+tangent.
 
 The forward side does not reimplement module math and does not replay once per
 parameter. For an active owning module, the runtime calls the module's original
@@ -112,8 +113,12 @@ parameter, so `dy_weight` and `dy_bias` remain separate local epsilons instead
 of being summed into a global tangent.
 
 The current backward side is still the narrow MLP/MSE milestone, not the final
-general backward-hook runtime. Its tensor programs are expressed through ATen
-primitives and run through the `DualTensor` registry:
+general backward-hook runtime. It no longer runs repeated per-parameter suffix
+applications from the loss hook. Instead, the loss hook initializes the
+model-output curvature side-channel, and activation hooks consume and propagate
+that side-channel as ordinary PyTorch backward reaches each block. The tensor
+programs are expressed through ATen primitives and run through the `DualTensor`
+registry:
 
 - Linear backward-side pieces use `aten.mm`, `aten.t`, and `aten.sum`.
 - ReLU dispatches as `aten.relu.default`; its backward-side program uses
@@ -124,18 +129,15 @@ primitives and run through the `DualTensor` registry:
 The backend has explicit graph-isolation tests: primal outputs keep
 `requires_grad` and `grad_fn`, while tangent outputs have
 `requires_grad == False` and `grad_fn is None`, even when the input tangent was
-created with `requires_grad=True`. The remaining runtime cost in these CPU
-benchmarks is therefore not from tangent-side autograd graph construction; it is
-from the current MLP/MSE backward-side suffix applications and Python dispatch
-overhead that still need broader runtime work.
+created with `requires_grad=True`.
 
 | Setting | Method | Max abs error | Max rel error | Mean time | Median RSS delta | Max RSS delta |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| MNIST preset | `modular_hvp` | 0.000e+00 | 0.000e+00 | 41.992 ms | 2.63 MiB | 2.71 MiB |
-| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 36.334 ms | 4.92 MiB | 4.96 MiB |
-| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 20.714 ms | 1.60 MiB | 1.81 MiB |
-| MNIST preset | `torch_backward` | n/a | n/a | 2.771 ms | 16.00 KiB | 16.00 KiB |
-| Larger stress | `modular_hvp` | 0.000e+00 | 0.000e+00 | 117.739 ms | 12.96 MiB | 14.55 MiB |
-| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 118.369 ms | 27.12 MiB | 27.15 MiB |
-| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 106.959 ms | 11.55 MiB | 11.55 MiB |
-| Larger stress | `torch_backward` | n/a | n/a | 12.921 ms | 16.00 KiB | 36.00 KiB |
+| MNIST preset | `modular_hvp` | 0.000e+00 | 0.000e+00 | 33.179 ms | 3.42 MiB | 3.46 MiB |
+| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 36.035 ms | 4.92 MiB | 5.02 MiB |
+| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 21.863 ms | 1.79 MiB | 1.86 MiB |
+| MNIST preset | `torch_backward` | n/a | n/a | 2.514 ms | 16.00 KiB | 16.00 KiB |
+| Larger stress | `modular_hvp` | 0.000e+00 | 0.000e+00 | 100.492 ms | 20.64 MiB | 20.65 MiB |
+| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 102.930 ms | 27.20 MiB | 27.22 MiB |
+| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 118.585 ms | 11.57 MiB | 11.61 MiB |
+| Larger stress | `torch_backward` | n/a | n/a | 11.881 ms | 16.00 KiB | 16.00 KiB |

@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch import nn
 
+import modular_hvp.local_mlp as local_mlp
 from modular_hvp import FakeDualBackend, LocalDualActivations, is_dual, modular_hvp
 
 
@@ -225,6 +226,48 @@ def test_default_modular_hvp_passes_dual_parameters_to_forward() -> None:
     assert layer.dual_weight_calls == 1
     assert layer.dual_bias_calls == 1
     assert layer.primal_calls == 0
+    for parameter in model.parameters():
+        assert parameter.hvp is not None
+
+
+def test_default_modular_hvp_does_not_replay_suffix_per_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(0)
+    model = nn.Sequential(
+        nn.Linear(3, 5),
+        nn.ReLU(),
+        nn.Linear(5, 4),
+        nn.ReLU(),
+        nn.Linear(4, 2),
+    ).double()
+    x = torch.randn(6, 3, dtype=torch.float64)
+    target = torch.randn(6, 2, dtype=torch.float64)
+    criterion = nn.MSELoss()
+    tangents = {
+        name: torch.randn_like(parameter)
+        for name, parameter in model.named_parameters()
+    }
+    counts = {"linear_input_backward": 0}
+    original = local_mlp._linear_input_backward_program
+
+    def counted_linear_input_backward(
+        weight: torch.Tensor,
+        grad_output: torch.Tensor,
+    ) -> torch.Tensor:
+        counts["linear_input_backward"] += 1
+        return original(weight, grad_output)
+
+    monkeypatch.setattr(
+        local_mlp,
+        "_linear_input_backward_program",
+        counted_linear_input_backward,
+    )
+
+    with modular_hvp(model, tangents):
+        criterion(model(x), target).backward()
+
+    assert counts["linear_input_backward"] == 2
     for parameter in model.parameters():
         assert parameter.hvp is not None
 
