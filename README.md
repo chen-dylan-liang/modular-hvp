@@ -64,12 +64,6 @@ reports a standard PyTorch `loss.backward()` pass as a first-order baseline:
 uv run python benchmarks/compare_toy_mlp.py
 ```
 
-For less noisy memory measurements, use the synthetic MNIST-shaped MLP preset:
-
-```bash
-uv run python benchmarks/compare_toy_mlp.py --preset mnist-mlp
-```
-
 The script reports max absolute/relative HVP error against `modular_hvp` plus
 wall-clock time, median/max sampled RSS delta, Python allocation peak, and CUDA
 allocation peak when running on CUDA. The `torch_backward` row is a timing and
@@ -79,15 +73,14 @@ credited for immediately dropping their outputs.
 
 `RSS delta` is the sampled increase in the process's resident set size during a
 method run. It is a coarse process-level measurement, so tiny toy runs can be
-noisy; the MNIST-shaped and larger stress settings make the memory differences
-more visible.
+noisy; deeper stress settings make the memory differences more visible.
 
 Recorded CPU runs:
 
 | Setting | Command | Shape |
 | --- | --- | --- |
-| Production-shaped MNIST MLP preset | `uv run python benchmarks/compare_toy_mlp.py --preset mnist-mlp --warmup 3 --repeats 20` | batch 256, input 784, hidden width 256, 3 hidden Linear/ReLU blocks, output 10, float32 |
-| Larger stress run | `uv run python benchmarks/compare_toy_mlp.py --batch-size 512 --d-in 784 --d-hidden 512 --hidden-layers 4 --d-out 10 --dtype float32 --warmup 3 --repeats 20` | batch 512, input 784, hidden width 512, 4 hidden Linear/ReLU blocks, output 10, float32 |
+| Toy 4-layer MLP | `uv run python benchmarks/compare_toy_mlp.py --batch-size 512 --d-in 784 --d-hidden 512 --hidden-layers 4 --d-out 10 --dtype float32 --warmup 3 --repeats 20` | batch 512, input 784, hidden width 512, 4 hidden Linear/ReLU blocks, output 10, float32 |
+| Deep stress 50-layer MLP | `uv run python benchmarks/compare_toy_mlp.py --batch-size 256 --d-in 784 --d-hidden 256 --hidden-layers 50 --d-out 10 --dtype float32 --warmup 1 --repeats 3` | batch 256, input 784, hidden width 256, 50 hidden Linear/ReLU blocks, output 10, float32 |
 
 Latest local results:
 
@@ -125,8 +118,9 @@ registry:
 - Linear backward-side pieces use `aten.mm`, `aten.t`, and `aten.sum`.
 - ReLU dispatches as `aten.relu.default`; its backward-side program uses
   `aten.threshold_backward.default`.
-- MSE loss dispatches as `aten.mse_loss.default`; its backward-side curvature
-  program uses `aten.mse_loss_backward.default`.
+- MSE loss dispatches as ordinary PyTorch `mse_loss`; the local runtime only
+  uses the scalar Hessian scale at the model-output boundary for reductions
+  `mean` and `sum`.
 
 The backend has explicit graph-isolation tests: primal outputs keep
 `requires_grad` and `grad_fn`, while tangent outputs have
@@ -135,11 +129,11 @@ created with `requires_grad=True`.
 
 | Setting | Method | Max abs error | Max rel error | Mean time | Median RSS delta | Max RSS delta |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| MNIST preset | `modular_hvp` | 0.000e+00 | 0.000e+00 | 30.955 ms | 1.84 MiB | 1.89 MiB |
-| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 35.520 ms | 4.92 MiB | 5.00 MiB |
-| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 20.417 ms | 1.78 MiB | 1.82 MiB |
-| MNIST preset | `torch_backward` | n/a | n/a | 2.791 ms | 16.00 KiB | 16.00 KiB |
-| Larger stress | `modular_hvp` | 0.000e+00 | 0.000e+00 | 101.255 ms | 10.32 MiB | 10.48 MiB |
-| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 113.975 ms | 27.19 MiB | 27.29 MiB |
-| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 131.983 ms | 11.55 MiB | 11.64 MiB |
-| Larger stress | `torch_backward` | n/a | n/a | 13.737 ms | 16.00 KiB | 20.00 KiB |
+| Toy 4-layer | `modular_hvp` | 0.000e+00 | 0.000e+00 | 101.255 ms | 10.32 MiB | 10.48 MiB |
+| Toy 4-layer | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 113.975 ms | 27.19 MiB | 27.29 MiB |
+| Toy 4-layer | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 131.983 ms | 11.55 MiB | 11.64 MiB |
+| Toy 4-layer | `torch_backward` | n/a | n/a | 13.737 ms | 16.00 KiB | 20.00 KiB |
+| Deep stress 50-layer | `modular_hvp` | 0.000e+00 | 0.000e+00 | 4519.322 ms | 72.35 MiB | 72.58 MiB |
+| Deep stress 50-layer | `backpack_hmp` | 1.490e-08 | 8.969e-07 | 6600.170 ms | 110.85 MiB | 111.02 MiB |
+| Deep stress 50-layer | `backpack_autodiff` | 1.490e-08 | 8.969e-07 | 5802.694 ms | 73.83 MiB | 73.83 MiB |
+| Deep stress 50-layer | `torch_backward` | n/a | n/a | 36.219 ms | 9.78 MiB | 9.78 MiB |
