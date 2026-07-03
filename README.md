@@ -135,11 +135,11 @@ created with `requires_grad=True`.
 
 | Setting | Method | Max abs error | Max rel error | Mean time | Median RSS delta | Max RSS delta |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| MNIST preset | `modular_hvp` | 0.000e+00 | 0.000e+00 | 32.110 ms | 1.85 MiB | 2.07 MiB |
-| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 35.248 ms | 4.88 MiB | 4.95 MiB |
-| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 21.267 ms | 1.79 MiB | 1.84 MiB |
-| MNIST preset | `torch_backward` | n/a | n/a | 2.638 ms | 16.00 KiB | 20.00 KiB |
-| Larger stress | `modular_hvp` | 0.000e+00 | 0.000e+00 | 100.831 ms | 16.30 MiB | 16.60 MiB |
-| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 107.479 ms | 27.18 MiB | 27.27 MiB |
-| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 110.301 ms | 11.55 MiB | 11.70 MiB |
-| Larger stress | `torch_backward` | n/a | n/a | 11.712 ms | 16.00 KiB | 20.00 KiB |
+| MNIST preset | `modular_hvp` | 0.000e+00 | 0.000e+00 | 30.955 ms | 1.84 MiB | 1.89 MiB |
+| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 35.520 ms | 4.92 MiB | 5.00 MiB |
+| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 20.417 ms | 1.78 MiB | 1.82 MiB |
+| MNIST preset | `torch_backward` | n/a | n/a | 2.791 ms | 16.00 KiB | 16.00 KiB |
+| Larger stress | `modular_hvp` | 0.000e+00 | 0.000e+00 | 101.255 ms | 10.32 MiB | 10.48 MiB |
+| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 113.975 ms | 27.19 MiB | 27.29 MiB |
+| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 131.983 ms | 11.55 MiB | 11.64 MiB |
+| Larger stress | `torch_backward` | n/a | n/a | 13.737 ms | 16.00 KiB | 20.00 KiB |

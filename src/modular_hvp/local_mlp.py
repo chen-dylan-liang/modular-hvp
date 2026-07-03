@@ -14,7 +14,7 @@ from modular_hvp.dual import (
     TangentPayload,
     _extract_tangent,
     _make_multi_dual,
-    make_dual,
+    _make_zero_dual,
     primal,
     tangent,
 )
@@ -55,8 +55,9 @@ class LossPatch:
 
 @dataclass(frozen=True, slots=True)
 class MSELossRecord:
-    input_primal: torch.Tensor
-    target_primal: torch.Tensor
+    input_numel: int
+    device: torch.device
+    dtype: torch.dtype
     reduction: str
 
 
@@ -65,7 +66,6 @@ class RuntimeState:
     entered: bool = False
     forward_patch: ForwardPatch | None = None
     loss_patch: LossPatch | None = None
-    records: list[ForwardRecord] = field(default_factory=list)
     loss_record: MSELossRecord | None = None
     primal_loss: torch.Tensor | None = None
     backward_called: bool = False
@@ -135,7 +135,6 @@ class LocalMLPHVPRuntime:
         for module in self.model.modules():
             if getattr(module, self._ACTIVE_ATTR, False):
                 delattr(module, self._ACTIVE_ATTR)
-        self._state.records.clear()
         self._state.loss_record = None
         self._state.primal_loss = None
         self._state.output_id = None
@@ -166,8 +165,9 @@ class LocalMLPHVPRuntime:
                 "modular_hvp currently supports mse_loss reductions 'mean' and 'sum'"
             )
         self._state.loss_record = MSELossRecord(
-            input_primal=input_primal.detach(),
-            target_primal=target_primal.detach(),
+            input_numel=input_primal.numel(),
+            device=input_primal.device,
+            dtype=input_primal.dtype,
             reduction=reduction,
         )
         self._state.primal_loss = primal_loss
@@ -177,17 +177,6 @@ class LocalMLPHVPRuntime:
     def _clear_hvp_slots(self) -> None:
         for block in self.parameter_blocks:
             setattr(block.parameter, "hvp", None)
-
-    def _initialize_hvp_accumulators(self) -> None:
-        for block in self.parameter_blocks:
-            setattr(
-                block.parameter,
-                "hvp",
-                torch.zeros_like(
-                    block.parameter,
-                    memory_format=torch.preserve_format,
-                ),
-            )
 
     def _install_forward_wrapper(self) -> None:
         original_forward = self.model.forward
@@ -262,7 +251,6 @@ class LocalMLPHVPRuntime:
                 "LocalMLPHVPRuntime currently supports a single tensor model input"
             )
 
-        self._state.records.clear()
         self._state.output_id = None
         self._state.output_tangent = None
         self._state.grad_tangents_by_tensor_id.clear()
@@ -330,7 +318,6 @@ class LocalMLPHVPRuntime:
             output_id=output_id,
             local_parameters=tuple(local_parameters),
         )
-        self._state.records.append(record)
         if output.requires_grad:
             output.register_hook(self._make_forward_record_hook(record))
         return output_hat
@@ -351,7 +338,6 @@ class LocalMLPHVPRuntime:
             input_id=id(input_primal_live),
             output_id=id(output),
         )
-        self._state.records.append(record)
         if output.requires_grad:
             output.register_hook(self._make_forward_record_hook(record))
         return output_hat
@@ -399,17 +385,18 @@ class LocalMLPHVPRuntime:
             return
 
         with torch.no_grad():
-            self._initialize_hvp_accumulators()
             output_id = self._state.output_id
             output_tangent = self._state.output_tangent
             if output_id is None or output_tangent is None:
                 raise RuntimeError("missing saved model-output tangent")
             scale = _mse_hessian_scale(loss_record)
             grad_scale = grad.detach()
-            output_grad_tangent = _map_tangent_payload(
-                lambda item: grad_scale * scale * item,
+            output_grad_tangent = _scale_tangent_payload_for_loss(
                 output_tangent,
+                grad_scale * scale,
             )
+            self._state.output_tangent = None
+            self._state.loss_record = None
             self._state.grad_tangents_by_tensor_id[output_id] = output_grad_tangent
             self._state.eager_backward_active = True
 
@@ -465,13 +452,13 @@ class LocalMLPHVPRuntime:
                 raise RuntimeError("local dual activation belongs to wrong module")
             self._accumulate_hvp(parameter, hvp)
 
-        upstream_tangent = _drop_tangent_payload_keys(
+        upstream_tangent = _drop_tangent_payload_keys_in_place(
             grad_tangent,
             local_parameters,
         )
         if upstream_tangent is None:
             return
-        grad_output_hat = _make_dual_payload(torch.zeros_like(grad), upstream_tangent)
+        grad_output_hat = _make_dual_payload(upstream_tangent)
         input_tangent_hat = _linear_input_backward_program(
             record.module.weight.detach(),
             grad_output_hat,
@@ -488,7 +475,7 @@ class LocalMLPHVPRuntime:
         grad: torch.Tensor,
         grad_tangent: TangentPayload,
     ) -> None:
-        grad_output_hat = _make_dual_payload(torch.zeros_like(grad), grad_tangent)
+        grad_output_hat = _make_dual_payload(grad_tangent)
         input_tangent_hat = _relu_backward_program(record.input_primal, grad_output_hat)
         self._accumulate_grad_tangent(record.input_id, tangent(input_tangent_hat))
 
@@ -581,30 +568,6 @@ def _relu_backward_program(
     return torch.ops.aten.threshold_backward.default(grad_output, input_value, 0)
 
 
-def _mse_input_backward_program(
-    input_value: torch.Tensor,
-    target: torch.Tensor,
-    grad_output: torch.Tensor,
-    reduction: str,
-) -> torch.Tensor:
-    return torch.ops.aten.mse_loss_backward.default(
-        grad_output,
-        input_value,
-        target,
-        _mse_reduction_enum(reduction),
-    )
-
-
-def _mse_reduction_enum(reduction: str) -> int:
-    if reduction == "none":
-        return 0
-    if reduction == "mean":
-        return 1
-    if reduction == "sum":
-        return 2
-    raise ValueError(f"unknown mse_loss reduction: {reduction!r}")
-
-
 def _parameter_use_counts(model: nn.Module) -> dict[nn.Parameter, int]:
     counts: dict[nn.Parameter, int] = {}
     for module in _iter_supported_modules(model):
@@ -622,28 +585,36 @@ def _primal(value: Any) -> Any:
 
 def _mse_hessian_scale(record: MSELossRecord) -> torch.Tensor:
     if record.reduction == "mean":
-        return record.input_primal.new_tensor(2.0 / record.input_primal.numel())
+        return torch.tensor(
+            2.0 / record.input_numel,
+            device=record.device,
+            dtype=record.dtype,
+        )
     if record.reduction == "sum":
-        return record.input_primal.new_tensor(2.0)
+        return torch.tensor(2.0, device=record.device, dtype=record.dtype)
     raise ValueError(f"unknown mse_loss reduction: {record.reduction!r}")
 
 
-def _make_dual_payload(
-    primal_value: torch.Tensor,
-    payload: TangentPayload,
-) -> torch.Tensor:
-    if isinstance(payload, dict):
-        return _make_multi_dual(primal_value, payload)
-    return make_dual(primal_value, payload)
+def _make_dual_payload(payload: TangentPayload) -> torch.Tensor:
+    return _make_zero_dual(payload)
 
 
-def _map_tangent_payload(
-    fn: Callable[[torch.Tensor], torch.Tensor],
+def _scale_tangent_payload_for_loss(
     payload: TangentPayload,
+    factor: torch.Tensor,
 ) -> TangentPayload:
     if isinstance(payload, dict):
-        return {key: fn(value) for key, value in payload.items()}
-    return fn(payload)
+        for key, value in list(payload.items()):
+            payload[key] = _scale_tensor_for_loss(value, factor)
+        return payload
+    return _scale_tensor_for_loss(payload, factor)
+
+
+def _scale_tensor_for_loss(value: torch.Tensor, factor: torch.Tensor) -> torch.Tensor:
+    if value.is_contiguous():
+        value.mul_(factor)
+        return value
+    return value * factor
 
 
 def _add_tangent_payloads(
@@ -668,14 +639,15 @@ def _add_tangent_payloads(
     return left + right
 
 
-def _drop_tangent_payload_keys(
+def _drop_tangent_payload_keys_in_place(
     payload: TangentPayload,
     keys: set[nn.Parameter],
 ) -> TangentPayload | None:
     if not isinstance(payload, dict):
         return None if keys else payload
-    output = {key: value for key, value in payload.items() if key not in keys}
-    return output or None
+    for key in keys:
+        payload.pop(key, None)
+    return payload or None
 
 
 def _normalize_backward_kwargs(

@@ -35,7 +35,7 @@ class DualTensor(torch.Tensor):
         *,
         primal_is_zero: bool = False,
     ) -> "DualTensor":
-        metadata = tangent if primal_is_zero else primal
+        metadata = _first_tangent_tensor(tangent) if primal_is_zero else primal
         if metadata is None:
             raise TypeError("primal must be a torch.Tensor unless primal_is_zero=True")
         if metadata.layout != torch.strided:
@@ -60,8 +60,7 @@ class DualTensor(torch.Tensor):
     ) -> None:
         tangent = _detach_tangent_payload(tangent)
         if primal_is_zero:
-            if not isinstance(tangent, torch.Tensor):
-                raise TypeError("zero-primal tangent must be a torch.Tensor")
+            _validate_tangent_payload_consistency(tangent)
             primal = None
         else:
             if primal is None:
@@ -127,7 +126,7 @@ class DualTensor(torch.Tensor):
     def primal(self) -> torch.Tensor:
         if self._primal_is_zero:
             return torch.zeros_like(
-                self._tangent,
+                _first_tangent_tensor(self._tangent),
                 memory_format=torch.preserve_format,
             )
         assert self._primal is not None
@@ -164,9 +163,7 @@ def _make_multi_dual(
     return DualTensor(primal_value, dict(tangents))
 
 
-def _make_zero_dual(tangent_value: torch.Tensor) -> DualTensor:
-    if not isinstance(tangent_value, torch.Tensor):
-        raise TypeError("tangent must be a torch.Tensor")
+def _make_zero_dual(tangent_value: TangentPayload) -> DualTensor:
     return DualTensor(None, tangent_value, primal_is_zero=True)
 
 
@@ -233,6 +230,37 @@ def _detach_tangent_payload(value: TangentPayload) -> TangentPayload:
     if _is_tangent_map(value):
         return {key: item.detach() for key, item in value.items()}
     return value.detach()
+
+
+def _first_tangent_tensor(value: TangentPayload) -> torch.Tensor:
+    if _is_tangent_map(value):
+        try:
+            return next(iter(value.values()))
+        except StopIteration as error:
+            raise ValueError("multi-dual tangent payload must not be empty") from error
+    return value
+
+
+def _validate_tangent_payload_consistency(value: TangentPayload) -> None:
+    if not _is_tangent_map(value):
+        return
+    sample = _first_tangent_tensor(value)
+    for key, item in value.items():
+        if item.shape != sample.shape:
+            raise ValueError(
+                f"zero-primal tangent for block {key!r} has shape "
+                f"{tuple(item.shape)}; expected {tuple(sample.shape)}"
+            )
+        if item.device != sample.device:
+            raise ValueError(
+                f"zero-primal tangent for block {key!r} is on {item.device}; "
+                f"expected {sample.device}"
+            )
+        if item.dtype != sample.dtype:
+            raise ValueError(
+                f"zero-primal tangent for block {key!r} has dtype {item.dtype}; "
+                f"expected {sample.dtype}"
+            )
 
 
 def _assert_tangent_payload_is_graph_free(value: TangentPayload) -> None:
@@ -414,6 +442,20 @@ def _map_tangent_payload(fn: Callable[[torch.Tensor], torch.Tensor], value: Any)
     return fn(value)
 
 
+def _zero_matmul_tangent_payload(left: Any, right: Any) -> Any:
+    left_sample = _first_tangent_tensor(left)
+    right_sample = _first_tangent_tensor(right)
+    sample_output = torch.zeros_like(left_sample @ right_sample)
+    if _is_tangent_map(left) or _is_tangent_map(right):
+        keys = set()
+        if _is_tangent_map(left):
+            keys.update(left.keys())
+        if _is_tangent_map(right):
+            keys.update(right.keys())
+        return {key: sample_output.clone() for key in keys}
+    return sample_output
+
+
 def _extract_tangent(value: Any, key: object) -> torch.Tensor:
     if _is_tangent_map(value):
         return value[key]
@@ -456,9 +498,13 @@ def _zero_scalar_like(value: torch.Tensor) -> torch.Tensor:
 def _apply_same_unary_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
     if args and _is_zero_primal(args[0]):
         with torch.no_grad():
-            tangent_args = _tree_map(tangent, args)
-            tangent_kwargs = _tree_map(tangent, kwargs)
-            return _make_zero_rule_output(func(*tangent_args, **tangent_kwargs))
+            value_t = tangent(args[0])
+            other_args = args[1:]
+            tangent_output = _map_tangent_payload(
+                lambda item: func(item, *_tree_detach(other_args), **kwargs),
+                value_t,
+            )
+            return _make_zero_rule_output(tangent_output)
     value = args[0]
     value_p, value_t, _ = _split(value)
     other_args = args[1:]
@@ -690,11 +736,22 @@ def _matmul_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Du
     if left_is_zero or right_is_zero:
         with torch.no_grad():
             if left_is_zero and right_is_zero:
-                tangent_output = torch.zeros_like(tangent(left) @ tangent(right))
+                tangent_output = _zero_matmul_tangent_payload(
+                    tangent(left),
+                    tangent(right),
+                )
             elif left_is_zero:
-                tangent_output = tangent(left) @ primal(right).detach()
+                right_ng = primal(right).detach()
+                tangent_output = _map_tangent_payload(
+                    lambda item: item @ right_ng,
+                    tangent(left),
+                )
             else:
-                tangent_output = primal(left).detach() @ tangent(right)
+                left_ng = primal(left).detach()
+                tangent_output = _map_tangent_payload(
+                    lambda item: left_ng @ item,
+                    tangent(right),
+                )
         return _make_zero_rule_output(tangent_output)
 
     left_p, left_t, left_is_dual = _split(left)
@@ -793,7 +850,10 @@ def _reduction_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) ->
     value = args[0]
     if _is_zero_primal(value):
         return _make_zero_rule_output(
-            func(tangent(value), *args[1:], **kwargs),
+            _map_tangent_payload(
+                lambda item: func(item, *args[1:], **kwargs),
+                tangent(value),
+            ),
         )
     value_p, value_t, _ = _split(value)
     other_args = args[1:]
@@ -867,10 +927,13 @@ def _threshold_backward_rule(
     if _is_zero_primal(grad_output):
         with torch.no_grad():
             input_ng = input_p.detach()
-            tangent_output = torch.where(
-                input_ng > threshold,
+            tangent_output = _map_tangent_payload(
+                lambda item: torch.where(
+                    input_ng > threshold,
+                    item,
+                    _zero_scalar_like(item),
+                ),
                 tangent(grad_output),
-                _zero_scalar_like(tangent(grad_output)),
             )
         return _make_zero_rule_output(tangent_output)
 
