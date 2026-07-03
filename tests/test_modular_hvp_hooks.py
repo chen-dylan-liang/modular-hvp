@@ -185,6 +185,29 @@ def test_default_modular_hvp_uses_original_module_forward() -> None:
         assert torch.allclose(parameter.hvp, reference_hvps[name], rtol=1e-10, atol=1e-10)
 
 
+def test_default_runtime_uses_autograd_saved_activation_refs() -> None:
+    class OffsetLinear(nn.Linear):
+        def forward(self, input: torch.Tensor) -> torch.Tensor:
+            return super().forward(input) + 1.25
+
+    torch.manual_seed(0)
+    layer = OffsetLinear(3, 4).double()
+    x = torch.randn(5, 3, dtype=torch.float64)
+    linear_output = layer(x)
+    linear_ref = local_mlp._make_linear_input_activation_ref(linear_output, x)
+
+    assert linear_ref.fallback is None
+    assert torch.equal(linear_ref.resolve_and_release(), x)
+    assert linear_ref.grad_fn is None
+
+    relu_output = torch.relu(linear_output)
+    relu_ref = local_mlp._make_relu_output_activation_ref(relu_output)
+
+    assert relu_ref.fallback is None
+    assert torch.equal(relu_ref.resolve_and_release(), relu_output)
+    assert relu_ref.grad_fn is None
+
+
 def test_default_modular_hvp_passes_dual_parameters_to_forward() -> None:
     class InspectLinear(nn.Linear):
         calls: int

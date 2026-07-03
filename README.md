@@ -127,6 +127,11 @@ registry:
   uses the scalar Hessian scale at the model-output boundary for reductions
   `mean` and `sum`.
 
+For Linear and ReLU activation values needed by the local backward-side tensor
+programs, the MLP runtime resolves tensors already saved by PyTorch autograd and
+releases the autograd-node reference inside the hook. It falls back to an
+explicit detached activation only when the expected saved tensor is unavailable.
+
 The backend has explicit graph-isolation tests: primal outputs keep
 `requires_grad` and `grad_fn`, while tangent outputs have
 `requires_grad == False` and `grad_fn is None`, even when the input tangent was
@@ -134,10 +139,10 @@ created with `requires_grad=True`.
 
 | Setting | Method | Max abs error | Max rel error | Mean time | Median avg RSS | Median peak RSS | Max peak RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Toy 4-layer | `modular_hvp` | 0.000e+00 | 0.000e+00 | 76.394 ms | 196.99 MiB | 205.00 MiB | 205.27 MiB |
-| Toy 4-layer | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 83.965 ms | 357.43 MiB | 366.50 MiB | 460.75 MiB |
-| Toy 4-layer | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 95.043 ms | 248.92 MiB | 256.76 MiB | 256.97 MiB |
-| Toy 4-layer | `torch_backward` | n/a | n/a | 12.249 ms | 182.17 MiB | 182.19 MiB | 182.26 MiB |
+| Toy 4-layer | `modular_hvp` | 0.000e+00 | 0.000e+00 | 71.886 ms | 193.99 MiB | 200.92 MiB | 201.12 MiB |
+| Toy 4-layer | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 76.389 ms | 357.83 MiB | 366.68 MiB | 460.75 MiB |
+| Toy 4-layer | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 87.405 ms | 248.85 MiB | 256.59 MiB | 256.86 MiB |
+| Toy 4-layer | `torch_backward` | n/a | n/a | 8.446 ms | 182.01 MiB | 182.01 MiB | 182.10 MiB |
 | Deep stress 50-layer | `modular_hvp` | 0.000e+00 | 0.000e+00 | 13003.740 ms | 401.54 MiB | 431.33 MiB | 431.98 MiB |
 | Deep stress 50-layer | `backpack_hmp` | 7.451e-09 | 1.206e-06 | 14258.464 ms | 906.65 MiB | 936.36 MiB | 1.11 GiB |
 | Deep stress 50-layer | `backpack_autodiff` | 7.451e-09 | 7.954e-07 | 14908.764 ms | 433.74 MiB | 478.16 MiB | 478.46 MiB |

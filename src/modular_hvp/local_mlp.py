@@ -24,7 +24,7 @@ from modular_hvp.runtime import ParameterBlock, _resolve_parameter_blocks
 @dataclass(frozen=True, slots=True)
 class LinearForwardRecord:
     module: nn.Linear
-    input_primal: torch.Tensor
+    input_activation: SavedTensorRef
     input_id: int
     output_id: int
     local_parameters: tuple[nn.Parameter, ...]
@@ -32,12 +32,39 @@ class LinearForwardRecord:
 
 @dataclass(frozen=True, slots=True)
 class ReLUForwardRecord:
-    input_primal: torch.Tensor
+    output_activation: SavedTensorRef
     input_id: int
     output_id: int
 
 
 ForwardRecord = LinearForwardRecord | ReLUForwardRecord
+
+
+@dataclass(slots=True)
+class SavedTensorRef:
+    """One-shot access to a tensor PyTorch autograd already saved."""
+
+    grad_fn: Any | None
+    saved_attrs: tuple[str, ...]
+    expected_shape: torch.Size
+    fallback: torch.Tensor | None = None
+
+    def resolve_and_release(self) -> torch.Tensor:
+        try:
+            if self.grad_fn is not None:
+                saved = _find_saved_tensor(
+                    self.grad_fn,
+                    saved_attrs=self.saved_attrs,
+                    expected_shape=self.expected_shape,
+                )
+                if saved is not None:
+                    return saved
+            if self.fallback is not None:
+                return self.fallback
+            raise RuntimeError("could not resolve saved activation from autograd graph")
+        finally:
+            self.grad_fn = None
+            self.fallback = None
 
 
 @dataclass(slots=True)
@@ -277,7 +304,6 @@ class LocalMLPHVPRuntime:
         input_value: Any,
     ) -> Any:
         input_primal_live = primal(input_value)
-        input_primal = input_primal_live.detach()
         input_id = id(input_primal_live)
         dual_parameters: dict[str, torch.Tensor] = {}
         local_parameters: list[nn.Parameter] = []
@@ -313,7 +339,10 @@ class LocalMLPHVPRuntime:
         output_id = id(output)
         record = LinearForwardRecord(
             module=module,
-            input_primal=input_primal,
+            input_activation=_make_linear_input_activation_ref(
+                output,
+                input_primal_live,
+            ),
             input_id=input_id,
             output_id=output_id,
             local_parameters=tuple(local_parameters),
@@ -330,11 +359,10 @@ class LocalMLPHVPRuntime:
         if module.inplace:
             raise NotImplementedError("LocalMLPHVPRuntime does not support inplace ReLU")
         input_primal_live = primal(input_value)
-        input_primal = input_primal_live.detach()
         output_hat = self._call_module_forward(module, input_value)
         output = primal(output_hat)
         record = ReLUForwardRecord(
-            input_primal=input_primal,
+            output_activation=_make_relu_output_activation_ref(output),
             input_id=id(input_primal_live),
             output_id=id(output),
         )
@@ -435,12 +463,13 @@ class LocalMLPHVPRuntime:
         grad_tangent: TangentPayload,
     ) -> None:
         local_parameters = set(record.local_parameters)
+        input_activation = record.input_activation.resolve_and_release().detach()
         for parameter in record.local_parameters:
             parameter_grad_tangent = _extract_tangent(grad_tangent, parameter)
             if parameter is record.module.weight:
                 hvp = torch.ops.aten.mm.default(
                     torch.ops.aten.t.default(parameter_grad_tangent),
-                    record.input_primal,
+                    input_activation,
                 )
             elif parameter is record.module.bias:
                 hvp = torch.ops.aten.sum.dim_IntList(
@@ -476,7 +505,8 @@ class LocalMLPHVPRuntime:
         grad_tangent: TangentPayload,
     ) -> None:
         grad_output_hat = _make_dual_payload(grad_tangent)
-        input_tangent_hat = _relu_backward_program(record.input_primal, grad_output_hat)
+        relu_output = record.output_activation.resolve_and_release()
+        input_tangent_hat = _relu_backward_program(relu_output, grad_output_hat)
         self._accumulate_grad_tangent(record.input_id, tangent(input_tangent_hat))
 
     def _accumulate_grad_tangent(
@@ -553,6 +583,83 @@ def _iter_supported_modules(model: nn.Module) -> tuple[nn.Module, ...]:
         return tuple(model._modules.values())
     raise TypeError("unsupported model type")
 
+
+def _make_linear_input_activation_ref(
+    output: torch.Tensor,
+    input_value: torch.Tensor,
+) -> SavedTensorRef:
+    return _make_saved_tensor_ref(
+        grad_fn=output.grad_fn,
+        saved_attrs=("_saved_mat1", "_saved_self"),
+        expected_shape=input_value.shape,
+        fallback=input_value,
+    )
+
+
+def _make_relu_output_activation_ref(output: torch.Tensor) -> SavedTensorRef:
+    return _make_saved_tensor_ref(
+        grad_fn=output.grad_fn,
+        saved_attrs=("_saved_result",),
+        expected_shape=output.shape,
+        fallback=output,
+    )
+
+
+def _make_saved_tensor_ref(
+    *,
+    grad_fn: Any | None,
+    saved_attrs: tuple[str, ...],
+    expected_shape: torch.Size,
+    fallback: torch.Tensor,
+) -> SavedTensorRef:
+    ref = SavedTensorRef(
+        grad_fn=grad_fn,
+        saved_attrs=saved_attrs,
+        expected_shape=expected_shape,
+    )
+    if grad_fn is not None and _find_saved_tensor(
+        grad_fn,
+        saved_attrs=saved_attrs,
+        expected_shape=expected_shape,
+    ) is not None:
+        return ref
+    return SavedTensorRef(
+        grad_fn=grad_fn,
+        saved_attrs=saved_attrs,
+        expected_shape=expected_shape,
+        fallback=fallback.detach(),
+    )
+
+
+def _find_saved_tensor(
+    grad_fn: Any,
+    *,
+    saved_attrs: tuple[str, ...],
+    expected_shape: torch.Size,
+) -> torch.Tensor | None:
+    seen: set[int] = set()
+    stack = [grad_fn]
+    while stack:
+        node = stack.pop()
+        if node is None:
+            continue
+        node_id = id(node)
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        for attr in saved_attrs:
+            if not hasattr(node, attr):
+                continue
+            try:
+                value = getattr(node, attr)
+            except RuntimeError:
+                continue
+            if torch.is_tensor(value) and value.shape == expected_shape:
+                return value
+        for next_node, _ in getattr(node, "next_functions", ()):
+            if next_node is not None:
+                stack.append(next_node)
+    return None
 
 def _linear_input_backward_program(
     weight: torch.Tensor,
