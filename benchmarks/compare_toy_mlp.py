@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import multiprocessing as mp
 import statistics
 import threading
 import time
 import tracemalloc
+import traceback
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from multiprocessing.connection import Connection
 
 import psutil
 import torch
@@ -36,8 +40,9 @@ class MethodStats:
     mean_time_s: float
     min_time_s: float
     max_time_s: float
-    median_peak_rss_delta_bytes: int
-    peak_rss_delta_bytes: int
+    median_peak_rss_bytes: int
+    peak_rss_bytes: int
+    median_avg_rss_bytes: int
     peak_python_alloc_bytes: int
     peak_cuda_alloc_bytes: int | None
 
@@ -158,6 +163,16 @@ def _make_backpack_hmp_problem(
     )
 
 
+def _make_backpack_autodiff_problem(
+    config: ToyMLPConfig,
+) -> tuple[nn.Module, nn.Module, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Create a problem after loading BackPACK's autodiff HVP utility."""
+
+    from backpack.hessianfree import hvp as _hvp  # noqa: F401
+
+    return make_problem(config)
+
+
 def _backpack_hmp_prepared_block_hvp(
     model: nn.Module,
     loss_fn: nn.Module,
@@ -239,71 +254,172 @@ def compare_results(
 
 def benchmark_method(
     name: str,
-    method: BlockHVPFn,
     config: ToyMLPConfig,
     *,
-    problem_factory: ProblemFactory,
     warmup: int,
     repeats: int,
     rss_sample_interval_s: float,
 ) -> MethodStats:
+    result = _run_method_benchmark_in_child(
+        name=name,
+        config=config,
+        warmup=warmup,
+        repeats=repeats,
+        rss_sample_interval_s=rss_sample_interval_s,
+    )
+    return MethodStats(
+        method=name,
+        mean_time_s=statistics.mean(result["times"]),
+        min_time_s=min(result["times"]),
+        max_time_s=max(result["times"]),
+        median_peak_rss_bytes=int(statistics.median(result["peak_rss_values"])),
+        peak_rss_bytes=max(result["peak_rss_values"]),
+        median_avg_rss_bytes=int(statistics.median(result["avg_rss_values"])),
+        peak_python_alloc_bytes=max(result["peak_python_allocs"]),
+        peak_cuda_alloc_bytes=(
+            max(result["peak_cuda_allocs"]) if result["peak_cuda_allocs"] else None
+        ),
+    )
+
+
+def _run_method_benchmark_in_child(
+    *,
+    name: str,
+    config: ToyMLPConfig,
+    warmup: int,
+    repeats: int,
+    rss_sample_interval_s: float,
+) -> dict[str, list[Any]]:
     times: list[float] = []
-    peak_rss_deltas: list[int] = []
+    peak_rss_values: list[int] = []
+    avg_rss_values: list[int] = []
     peak_python_allocs: list[int] = []
     peak_cuda_allocs: list[int] = []
 
-    for index in range(warmup + repeats):
-        model, loss_fn, x, target, vectors = problem_factory(config)
-        if config.device.startswith("cuda"):
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
+    context = mp.get_context("spawn")
+    parent_conn, child_conn = context.Pipe(duplex=True)
+    process = context.Process(
+        target=_child_method_benchmark,
+        args=(name, config, warmup + repeats, child_conn),
+    )
+    process.start()
+    child_conn.close()
+    psutil_process = psutil.Process(process.pid)
 
-        with _PeakRSSDeltaSampler(rss_sample_interval_s) as rss_sampler:
+    try:
+        for expected_index in range(warmup + repeats):
+            ready_message = parent_conn.recv()
+            if ready_message["event"] == "error":
+                raise RuntimeError(ready_message["traceback"])
+            if ready_message["event"] != "ready":
+                raise RuntimeError(f"unexpected child message: {ready_message!r}")
+            if ready_message["index"] != expected_index:
+                raise RuntimeError(f"unexpected child index: {ready_message!r}")
+
+            with _ProcessRSSSampler(psutil_process, rss_sample_interval_s) as sampler:
+                parent_conn.send({"event": "start", "index": expected_index})
+                done_message = parent_conn.recv()
+
+            if done_message["event"] == "error":
+                raise RuntimeError(done_message["traceback"])
+            if done_message["event"] != "done":
+                raise RuntimeError(f"unexpected child message: {done_message!r}")
+            if done_message["index"] != expected_index:
+                raise RuntimeError(f"unexpected child index: {done_message!r}")
+
+            if expected_index >= warmup:
+                times.append(done_message["elapsed_s"])
+                peak_rss_values.append(sampler.peak_rss_bytes)
+                avg_rss_values.append(sampler.avg_rss_bytes)
+                peak_python_allocs.append(done_message["peak_python_alloc_bytes"])
+                if done_message["peak_cuda_alloc_bytes"] is not None:
+                    peak_cuda_allocs.append(done_message["peak_cuda_alloc_bytes"])
+    finally:
+        process.join()
+        parent_conn.close()
+
+    if process.exitcode != 0:
+        raise RuntimeError(f"child process for {name!r} exited with {process.exitcode}")
+
+    return {
+        "times": times,
+        "peak_rss_values": peak_rss_values,
+        "avg_rss_values": avg_rss_values,
+        "peak_python_allocs": peak_python_allocs,
+        "peak_cuda_allocs": peak_cuda_allocs,
+    }
+
+
+def _child_method_benchmark(
+    name: str,
+    config: ToyMLPConfig,
+    iterations: int,
+    conn: Connection,
+) -> None:
+    try:
+        spec = _methods()[name]
+        for index in range(iterations):
+            model, loss_fn, x, target, vectors = spec.make_problem(config)
+            if config.device.startswith("cuda"):
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+
+            conn.send({"event": "ready", "index": index})
+            start_message = conn.recv()
+            if start_message.get("event") != "start":
+                raise RuntimeError(f"unexpected parent message: {start_message!r}")
+            if start_message.get("index") != index:
+                raise RuntimeError(f"unexpected parent index: {start_message!r}")
+
             tracemalloc.start()
             start = time.perf_counter()
-            result = method(model, loss_fn, x, target, vectors)
+            result = spec.fn(model, loss_fn, x, target, vectors)
             if config.device.startswith("cuda"):
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - start
             _, peak_python_alloc = tracemalloc.get_traced_memory()
             tracemalloc.stop()
+            peak_cuda_alloc = (
+                torch.cuda.max_memory_allocated()
+                if config.device.startswith("cuda")
+                else None
+            )
+            conn.send(
+                {
+                    "event": "done",
+                    "index": index,
+                    "elapsed_s": elapsed,
+                    "peak_python_alloc_bytes": peak_python_alloc,
+                    "peak_cuda_alloc_bytes": peak_cuda_alloc,
+                }
+            )
+            del result, model, loss_fn, x, target, vectors
+            gc.collect()
+    except BaseException:
+        conn.send({"event": "error", "traceback": traceback.format_exc()})
+        raise
+    finally:
+        conn.close()
 
-        if index >= warmup:
-            times.append(elapsed)
-            peak_rss_deltas.append(rss_sampler.peak_delta_bytes)
-            peak_python_allocs.append(peak_python_alloc)
-            if config.device.startswith("cuda"):
-                peak_cuda_allocs.append(torch.cuda.max_memory_allocated())
-        del result
 
-    return MethodStats(
-        method=name,
-        mean_time_s=statistics.mean(times),
-        min_time_s=min(times),
-        max_time_s=max(times),
-        median_peak_rss_delta_bytes=int(statistics.median(peak_rss_deltas)),
-        peak_rss_delta_bytes=max(peak_rss_deltas),
-        peak_python_alloc_bytes=max(peak_python_allocs),
-        peak_cuda_alloc_bytes=max(peak_cuda_allocs) if peak_cuda_allocs else None,
-    )
-
-
-class _PeakRSSDeltaSampler:
-    def __init__(self, interval_s: float) -> None:
+class _ProcessRSSSampler:
+    def __init__(self, process: psutil.Process, interval_s: float) -> None:
         self.interval_s = interval_s
-        self.process = psutil.Process()
-        self.start_rss_bytes = 0
+        self.process = process
         self.peak_rss_bytes = 0
+        self._rss_sum_bytes = 0
+        self._sample_count = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     @property
-    def peak_delta_bytes(self) -> int:
-        return max(0, self.peak_rss_bytes - self.start_rss_bytes)
+    def avg_rss_bytes(self) -> int:
+        if self._sample_count == 0:
+            return self.peak_rss_bytes
+        return int(self._rss_sum_bytes / self._sample_count)
 
-    def __enter__(self) -> "_PeakRSSDeltaSampler":
-        self.start_rss_bytes = self.process.memory_info().rss
-        self.peak_rss_bytes = self.start_rss_bytes
+    def __enter__(self) -> "_ProcessRSSSampler":
+        self._record_sample()
         self._thread = threading.Thread(target=self._sample, daemon=True)
         self._thread.start()
         return self
@@ -312,14 +428,20 @@ class _PeakRSSDeltaSampler:
         self._stop.set()
         if self._thread is not None:
             self._thread.join()
-        self.peak_rss_bytes = max(self.peak_rss_bytes, self.process.memory_info().rss)
+        self._record_sample()
 
     def _sample(self) -> None:
         while not self._stop.wait(self.interval_s):
-            self.peak_rss_bytes = max(
-                self.peak_rss_bytes,
-                self.process.memory_info().rss,
-            )
+            self._record_sample()
+
+    def _record_sample(self) -> None:
+        try:
+            rss = self.process.memory_info().rss
+        except psutil.Error:
+            return
+        self.peak_rss_bytes = max(self.peak_rss_bytes, rss)
+        self._rss_sum_bytes += rss
+        self._sample_count += 1
 
 
 def _config_from_model_and_data(
@@ -367,7 +489,7 @@ def _methods() -> dict[str, MethodSpec]:
         "backpack_autodiff": MethodSpec(
             "backpack_autodiff",
             backpack_autodiff_block_hvp,
-            make_problem,
+            _make_backpack_autodiff_problem,
         ),
         "torch_backward": MethodSpec(
             "torch_backward",
@@ -404,7 +526,7 @@ def _print_results(
     print("\nBenchmark")
     header = (
         f"{'method':17s} {'mean ms':>10s} {'min ms':>10s} {'max ms':>10s} "
-        f"{'med RSS delta':>16s} {'max RSS delta':>16s} "
+        f"{'med avg RSS':>14s} {'med peak RSS':>14s} {'max peak RSS':>14s} "
         f"{'py alloc peak':>15s} {'cuda peak':>12s}"
     )
     print(header)
@@ -415,8 +537,9 @@ def _print_results(
             f"{item.mean_time_s * 1e3:10.3f} "
             f"{item.min_time_s * 1e3:10.3f} "
             f"{item.max_time_s * 1e3:10.3f} "
-            f"{_format_bytes(item.median_peak_rss_delta_bytes):>16s} "
-            f"{_format_bytes(item.peak_rss_delta_bytes):>16s} "
+            f"{_format_bytes(item.median_avg_rss_bytes):>14s} "
+            f"{_format_bytes(item.median_peak_rss_bytes):>14s} "
+            f"{_format_bytes(item.peak_rss_bytes):>14s} "
             f"{_format_bytes(item.peak_python_alloc_bytes):>15s} "
             f"{_format_bytes(item.peak_cuda_alloc_bytes):>12s}"
         )
@@ -496,9 +619,7 @@ def main() -> None:
     stats = [
         benchmark_method(
             spec.name,
-            spec.fn,
             config,
-            problem_factory=spec.make_problem,
             warmup=args.warmup,
             repeats=args.repeats,
             rss_sample_interval_s=args.rss_sample_interval_ms / 1000,

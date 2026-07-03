@@ -65,22 +65,27 @@ uv run python benchmarks/compare_toy_mlp.py
 ```
 
 The script reports max absolute/relative HVP error against `modular_hvp` plus
-wall-clock time, median/max sampled RSS delta, Python allocation peak, and CUDA
+wall-clock time, sampled per-process RSS, Python allocation peak, and CUDA
 allocation peak when running on CUDA. The `torch_backward` row is a timing and
-memory baseline only; it computes ordinary gradients, not HVPs. Returned HVP or
-gradient tensors are kept alive until the RSS sampler exits, so methods are not
-credited for immediately dropping their outputs.
+memory baseline only; it computes ordinary gradients, not HVPs.
 
-`RSS delta` is the sampled increase in the process's resident set size during a
-method run. It is a coarse process-level measurement, so tiny toy runs can be
-noisy; deeper stress settings make the memory differences more visible.
+For fair absolute RSS measurement, each method is benchmarked in its own spawned
+process. Method-specific setup and imports happen before warmup/measurement, so
+RSS includes the method's process footprint while timing focuses on the measured
+forward/backward/HVP computation. Returned HVP or gradient tensors are kept
+alive until the RSS sampler exits, so methods are not credited for immediately
+dropping their outputs.
+
+RSS is a coarse process-level measurement, so tiny toy runs can be noisy; deeper
+stress settings make the memory differences more visible. The table reports
+median average RSS, median peak RSS, and max peak RSS across measured repeats.
 
 Recorded CPU runs:
 
 | Setting | Command | Shape |
 | --- | --- | --- |
-| Toy 4-layer MLP | `uv run python benchmarks/compare_toy_mlp.py --batch-size 512 --d-in 784 --d-hidden 512 --hidden-layers 4 --d-out 10 --dtype float32 --warmup 3 --repeats 20` | batch 512, input 784, hidden width 512, 4 hidden Linear/ReLU blocks, output 10, float32 |
-| Deep stress 50-layer MLP | `uv run python benchmarks/compare_toy_mlp.py --batch-size 256 --d-in 784 --d-hidden 256 --hidden-layers 50 --d-out 10 --dtype float32 --warmup 1 --repeats 3` | batch 256, input 784, hidden width 256, 50 hidden Linear/ReLU blocks, output 10, float32 |
+| Toy 4-layer MLP | `uv run python benchmarks/compare_toy_mlp.py --batch-size 512 --d-in 784 --d-hidden 512 --hidden-layers 4 --d-out 10 --dtype float32 --warmup 2 --repeats 8` | batch 512, input 784, hidden width 512, 4 hidden Linear/ReLU blocks, output 10, float32 |
+| Deep stress 50-layer MLP | `uv run python benchmarks/compare_toy_mlp.py --batch-size 256 --d-in 784 --d-hidden 512 --hidden-layers 50 --d-out 10 --dtype float32 --warmup 1 --repeats 3` | batch 256, input 784, hidden width 512, 50 hidden Linear/ReLU blocks, output 10, float32 |
 
 Latest local results:
 
@@ -127,13 +132,13 @@ The backend has explicit graph-isolation tests: primal outputs keep
 `requires_grad == False` and `grad_fn is None`, even when the input tangent was
 created with `requires_grad=True`.
 
-| Setting | Method | Max abs error | Max rel error | Mean time | Median RSS delta | Max RSS delta |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Toy 4-layer | `modular_hvp` | 0.000e+00 | 0.000e+00 | 101.255 ms | 10.32 MiB | 10.48 MiB |
-| Toy 4-layer | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 113.975 ms | 27.19 MiB | 27.29 MiB |
-| Toy 4-layer | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 131.983 ms | 11.55 MiB | 11.64 MiB |
-| Toy 4-layer | `torch_backward` | n/a | n/a | 13.737 ms | 16.00 KiB | 20.00 KiB |
-| Deep stress 50-layer | `modular_hvp` | 0.000e+00 | 0.000e+00 | 4519.322 ms | 72.35 MiB | 72.58 MiB |
-| Deep stress 50-layer | `backpack_hmp` | 1.490e-08 | 8.969e-07 | 6600.170 ms | 110.85 MiB | 111.02 MiB |
-| Deep stress 50-layer | `backpack_autodiff` | 1.490e-08 | 8.969e-07 | 5802.694 ms | 73.83 MiB | 73.83 MiB |
-| Deep stress 50-layer | `torch_backward` | n/a | n/a | 36.219 ms | 9.78 MiB | 9.78 MiB |
+| Setting | Method | Max abs error | Max rel error | Mean time | Median avg RSS | Median peak RSS | Max peak RSS |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Toy 4-layer | `modular_hvp` | 0.000e+00 | 0.000e+00 | 76.394 ms | 196.99 MiB | 205.00 MiB | 205.27 MiB |
+| Toy 4-layer | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 83.965 ms | 357.43 MiB | 366.50 MiB | 460.75 MiB |
+| Toy 4-layer | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 95.043 ms | 248.92 MiB | 256.76 MiB | 256.97 MiB |
+| Toy 4-layer | `torch_backward` | n/a | n/a | 12.249 ms | 182.17 MiB | 182.19 MiB | 182.26 MiB |
+| Deep stress 50-layer | `modular_hvp` | 0.000e+00 | 0.000e+00 | 13003.740 ms | 401.54 MiB | 431.33 MiB | 431.98 MiB |
+| Deep stress 50-layer | `backpack_hmp` | 7.451e-09 | 1.206e-06 | 14258.464 ms | 906.65 MiB | 936.36 MiB | 1.11 GiB |
+| Deep stress 50-layer | `backpack_autodiff` | 7.451e-09 | 7.954e-07 | 14908.764 ms | 433.74 MiB | 478.16 MiB | 478.46 MiB |
+| Deep stress 50-layer | `torch_backward` | n/a | n/a | 97.658 ms | 302.61 MiB | 327.02 MiB | 327.31 MiB |
