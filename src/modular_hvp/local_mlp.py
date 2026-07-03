@@ -27,7 +27,7 @@ class LinearForwardRecord:
     input_primal: torch.Tensor
     input_id: int
     output_id: int
-    local_dual_activations: dict[nn.Parameter, torch.Tensor]
+    local_parameters: tuple[nn.Parameter, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,9 +78,10 @@ class RuntimeState:
 class LocalMLPHVPRuntime:
     """Default ModularHVP runtime for the current Linear/ReLU/MSE scope.
 
-    This runtime consumes parameter tangents inside the model forward and stores
-    only local output tangents for the module that owns each parameter. It does
-    not propagate parameter tangents through later layers in forward.
+    This runtime consumes parameter tangents inside the model forward and
+    carries the resulting block-keyed tangent payloads as graph-free side
+    channels. Backward hooks consume the matching payload when PyTorch reaches
+    the owning module and accumulate into the single public ``p.hvp`` slot.
     """
 
     _ACTIVE_RUNTIME: "LocalMLPHVPRuntime | None" = None
@@ -290,8 +291,8 @@ class LocalMLPHVPRuntime:
         input_primal_live = primal(input_value)
         input_primal = input_primal_live.detach()
         input_id = id(input_primal_live)
-        local_duals: dict[nn.Parameter, torch.Tensor] = {}
         dual_parameters: dict[str, torch.Tensor] = {}
+        local_parameters: list[nn.Parameter] = []
 
         weight_tangent = self._tangents_by_parameter.get(module.weight)
         if weight_tangent is not None:
@@ -299,6 +300,7 @@ class LocalMLPHVPRuntime:
                 module.weight,
                 {module.weight: weight_tangent.detach()},
             )
+            local_parameters.append(module.weight)
 
         if module.bias is not None:
             bias_tangent = self._tangents_by_parameter.get(module.bias)
@@ -307,6 +309,7 @@ class LocalMLPHVPRuntime:
                     module.bias,
                     {module.bias: bias_tangent.detach()},
                 )
+                local_parameters.append(module.bias)
 
         if dual_parameters:
             output_hat = self._run_module_with_dual_parameters(
@@ -315,13 +318,6 @@ class LocalMLPHVPRuntime:
                 input_value,
             )
             output = primal(output_hat)
-            tangent_payload = tangent(output_hat)
-            for parameter in self._active_module_parameters(module):
-                if parameter in self._tangents_by_parameter:
-                    local_duals[parameter] = _extract_tangent(
-                        tangent_payload,
-                        parameter,
-                    ).detach()
         else:
             output_hat = self._call_module_forward(module, input_value)
             output = primal(output_hat)
@@ -332,7 +328,7 @@ class LocalMLPHVPRuntime:
             input_primal=input_primal,
             input_id=input_id,
             output_id=output_id,
-            local_dual_activations=local_duals,
+            local_parameters=tuple(local_parameters),
         )
         self._state.records.append(record)
         if output.requires_grad:
@@ -390,14 +386,6 @@ class LocalMLPHVPRuntime:
         finally:
             for parameter_name, original_parameter in original_parameters.items():
                 module._parameters[parameter_name] = original_parameter
-
-    def _active_module_parameters(self, module: nn.Module) -> tuple[nn.Parameter, ...]:
-        parameters: list[nn.Parameter] = []
-        if isinstance(module, nn.Linear):
-            parameters.append(module.weight)
-            if module.bias is not None:
-                parameters.append(module.bias)
-        return tuple(parameters)
 
     def _start_eager_backward(self, grad: torch.Tensor) -> None:
         loss_record = self._state.loss_record
@@ -459,8 +447,8 @@ class LocalMLPHVPRuntime:
         grad: torch.Tensor,
         grad_tangent: TangentPayload,
     ) -> None:
-        local_parameters = set(record.local_dual_activations)
-        for parameter in record.local_dual_activations:
+        local_parameters = set(record.local_parameters)
+        for parameter in record.local_parameters:
             parameter_grad_tangent = _extract_tangent(grad_tangent, parameter)
             if parameter is record.module.weight:
                 hvp = torch.ops.aten.mm.default(
@@ -577,34 +565,6 @@ def _iter_supported_modules(model: nn.Module) -> tuple[nn.Module, ...]:
     if isinstance(model, nn.Sequential):
         return tuple(model._modules.values())
     raise TypeError("unsupported model type")
-
-
-def _linear_forward_program(
-    input_value: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-) -> torch.Tensor:
-    output = torch.ops.aten.mm.default(
-        input_value,
-        torch.ops.aten.t.default(weight),
-    )
-    if bias is not None:
-        output = torch.ops.aten.add.Tensor(output, bias)
-    return output
-
-
-def _linear_backward_program(
-    input_value: torch.Tensor,
-    weight: torch.Tensor,
-    grad_output: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    grad_input = _linear_input_backward_program(weight, grad_output)
-    grad_weight = torch.ops.aten.mm.default(
-        torch.ops.aten.t.default(grad_output),
-        input_value,
-    )
-    grad_bias = torch.ops.aten.sum.dim_IntList(grad_output, [0], False)
-    return grad_input, grad_weight, grad_bias
 
 
 def _linear_input_backward_program(

@@ -261,7 +261,7 @@ def benchmark_method(
         with _PeakRSSDeltaSampler(rss_sample_interval_s) as rss_sampler:
             tracemalloc.start()
             start = time.perf_counter()
-            method(model, loss_fn, x, target, vectors)
+            result = method(model, loss_fn, x, target, vectors)
             if config.device.startswith("cuda"):
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - start
@@ -274,6 +274,7 @@ def benchmark_method(
             peak_python_allocs.append(peak_python_alloc)
             if config.device.startswith("cuda"):
                 peak_cuda_allocs.append(torch.cuda.max_memory_allocated())
+        del result
 
     return MethodStats(
         method=name,

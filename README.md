@@ -73,7 +73,9 @@ uv run python benchmarks/compare_toy_mlp.py --preset mnist-mlp
 The script reports max absolute/relative HVP error against `modular_hvp` plus
 wall-clock time, median/max sampled RSS delta, Python allocation peak, and CUDA
 allocation peak when running on CUDA. The `torch_backward` row is a timing and
-memory baseline only; it computes ordinary gradients, not HVPs.
+memory baseline only; it computes ordinary gradients, not HVPs. Returned HVP or
+gradient tensors are kept alive until the RSS sampler exits, so methods are not
+credited for immediately dropping their outputs.
 
 `RSS delta` is the sampled increase in the process's resident set size during a
 method run. It is a coarse process-level measurement, so tiny toy runs can be
@@ -84,8 +86,8 @@ Recorded CPU runs:
 
 | Setting | Command | Shape |
 | --- | --- | --- |
-| Production-shaped MNIST MLP preset | `uv run python benchmarks/compare_toy_mlp.py --preset mnist-mlp --warmup 2 --repeats 8` | batch 256, input 784, hidden width 256, 3 hidden Linear/ReLU blocks, output 10, float32 |
-| Larger stress run | `uv run python benchmarks/compare_toy_mlp.py --batch-size 512 --d-in 784 --d-hidden 512 --hidden-layers 4 --d-out 10 --dtype float32 --warmup 1 --repeats 3` | batch 512, input 784, hidden width 512, 4 hidden Linear/ReLU blocks, output 10, float32 |
+| Production-shaped MNIST MLP preset | `uv run python benchmarks/compare_toy_mlp.py --preset mnist-mlp --warmup 3 --repeats 20` | batch 256, input 784, hidden width 256, 3 hidden Linear/ReLU blocks, output 10, float32 |
+| Larger stress run | `uv run python benchmarks/compare_toy_mlp.py --batch-size 512 --d-in 784 --d-hidden 512 --hidden-layers 4 --d-out 10 --dtype float32 --warmup 3 --repeats 20` | batch 512, input 784, hidden width 512, 4 hidden Linear/ReLU blocks, output 10, float32 |
 
 Latest local results:
 
@@ -133,11 +135,11 @@ created with `requires_grad=True`.
 
 | Setting | Method | Max abs error | Max rel error | Mean time | Median RSS delta | Max RSS delta |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| MNIST preset | `modular_hvp` | 0.000e+00 | 0.000e+00 | 33.179 ms | 3.42 MiB | 3.46 MiB |
-| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 36.035 ms | 4.92 MiB | 5.02 MiB |
-| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 21.863 ms | 1.79 MiB | 1.86 MiB |
-| MNIST preset | `torch_backward` | n/a | n/a | 2.514 ms | 16.00 KiB | 16.00 KiB |
-| Larger stress | `modular_hvp` | 0.000e+00 | 0.000e+00 | 100.492 ms | 20.64 MiB | 20.65 MiB |
-| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 102.930 ms | 27.20 MiB | 27.22 MiB |
-| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 118.585 ms | 11.57 MiB | 11.61 MiB |
-| Larger stress | `torch_backward` | n/a | n/a | 11.881 ms | 16.00 KiB | 16.00 KiB |
+| MNIST preset | `modular_hvp` | 0.000e+00 | 0.000e+00 | 32.110 ms | 1.85 MiB | 2.07 MiB |
+| MNIST preset | `backpack_hmp` | 3.725e-09 | 3.351e-07 | 35.248 ms | 4.88 MiB | 4.95 MiB |
+| MNIST preset | `backpack_autodiff` | 3.725e-09 | 3.351e-07 | 21.267 ms | 1.79 MiB | 1.84 MiB |
+| MNIST preset | `torch_backward` | n/a | n/a | 2.638 ms | 16.00 KiB | 20.00 KiB |
+| Larger stress | `modular_hvp` | 0.000e+00 | 0.000e+00 | 100.831 ms | 16.30 MiB | 16.60 MiB |
+| Larger stress | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 107.479 ms | 27.18 MiB | 27.27 MiB |
+| Larger stress | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 110.301 ms | 11.55 MiB | 11.70 MiB |
+| Larger stress | `torch_backward` | n/a | n/a | 11.712 ms | 16.00 KiB | 20.00 KiB |
