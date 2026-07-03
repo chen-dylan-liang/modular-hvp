@@ -14,6 +14,11 @@ from modular_hvp import (
 )
 
 
+def _assert_graph_free(value: torch.Tensor) -> None:
+    assert not value.requires_grad
+    assert value.grad_fn is None
+
+
 def _central_difference(
     fn,
     values: tuple[torch.Tensor, ...],
@@ -61,6 +66,27 @@ def test_matmul_matches_finite_difference() -> None:
     assert torch.allclose(tangent(output), fd, rtol=1e-6, atol=1e-6)
 
 
+def test_matmul_primal_keeps_graph_and_tangent_is_graph_free() -> None:
+    torch.manual_seed(11)
+    x = torch.randn(4, 4, requires_grad=True)
+    w = torch.randn(4, 4, requires_grad=True)
+    x_dot = torch.randn_like(x, requires_grad=True)
+    w_dot = torch.randn_like(w, requires_grad=True)
+
+    y_hat = make_dual(x, x_dot) @ make_dual(w, w_dot)
+
+    assert primal(y_hat).requires_grad
+    assert primal(y_hat).grad_fn is not None
+    _assert_graph_free(tangent(y_hat))
+
+    primal(y_hat).sum().backward()
+
+    assert x.grad is not None
+    assert w.grad is not None
+    assert x_dot.grad is None
+    assert w_dot.grad is None
+
+
 def test_relu_matches_finite_difference_away_from_kinks() -> None:
     torch.manual_seed(2)
     x = torch.randn(6, 7, dtype=torch.float64)
@@ -75,6 +101,25 @@ def test_relu_matches_finite_difference_away_from_kinks() -> None:
 
     assert torch.allclose(primal(output), fn(x))
     assert torch.allclose(tangent(output), fd, rtol=1e-6, atol=1e-6)
+
+
+def test_relu_primal_keeps_graph_and_tangent_is_graph_free() -> None:
+    torch.manual_seed(12)
+    x = torch.randn(16, requires_grad=True)
+    with torch.no_grad():
+        x.copy_(x + 0.1 * torch.sign(x))
+    x_dot = torch.randn_like(x, requires_grad=True)
+
+    y_hat = torch.relu(make_dual(x, x_dot))
+
+    assert primal(y_hat).requires_grad
+    assert primal(y_hat).grad_fn is not None
+    _assert_graph_free(tangent(y_hat))
+
+    h = 1e-4
+    with torch.no_grad():
+        fd = (torch.relu(x + h * x_dot) - torch.relu(x)) / h
+    torch.testing.assert_close(tangent(y_hat), fd, rtol=1e-2, atol=1e-3)
 
 
 def test_linear_weight_dual_matches_finite_difference() -> None:
@@ -98,6 +143,9 @@ def test_linear_weight_dual_matches_finite_difference() -> None:
     assert isinstance(layer.weight, nn.Parameter)
     assert torch.allclose(primal(output), base)
     assert torch.allclose(tangent(output), fd, rtol=1e-6, atol=1e-6)
+    assert primal(output).requires_grad
+    assert primal(output).grad_fn is not None
+    _assert_graph_free(tangent(output))
 
 
 def test_toy_mlp_single_dual_parameter_matches_finite_difference() -> None:
@@ -133,6 +181,9 @@ def test_toy_mlp_single_dual_parameter_matches_finite_difference() -> None:
     assert isinstance(model[0].weight, nn.Parameter)
     assert torch.allclose(primal(output), base)
     assert torch.allclose(tangent(output), fd, rtol=1e-5, atol=1e-6)
+    assert primal(output).requires_grad
+    assert primal(output).grad_fn is not None
+    _assert_graph_free(tangent(output))
 
 
 def test_backward_like_tensor_program_matches_finite_difference() -> None:
@@ -236,13 +287,18 @@ def test_reverse_scalar_and_matmul_rules() -> None:
 
 def test_unpack_dual_and_unsupported_ops() -> None:
     x = torch.randn(3, dtype=torch.float64)
-    x_dot = torch.randn_like(x)
+    x_dot = torch.randn_like(x, requires_grad=True)
     dual = make_dual(x, x_dot)
 
     primal_value, tangent_value = unpack_dual(dual)
     assert primal_value is x
-    assert tangent_value is x_dot
-    with pytest.raises(TypeError, match="expected a DualTensor"):
-        unpack_dual(x)  # type: ignore[arg-type]
+    assert tangent_value is not x_dot
+    assert torch.allclose(tangent_value, x_dot)
+    _assert_graph_free(tangent_value)
+
+    primal_value, tangent_value = unpack_dual(x)
+    assert primal_value is x
+    assert tangent_value is None
+
     with pytest.raises(NotImplementedError, match="DualTensor rule not implemented"):
         torch.sin(dual)
