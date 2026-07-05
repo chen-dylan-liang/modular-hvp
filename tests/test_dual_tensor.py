@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 import modular_hvp.dual as dual_backend
 from modular_hvp import (
@@ -153,6 +156,126 @@ def test_linear_weight_dual_matches_finite_difference() -> None:
     _assert_graph_free(tangent(output))
 
 
+def test_conv2d_weight_dual_matches_finite_difference() -> None:
+    torch.manual_seed(8)
+    layer = nn.Conv2d(2, 3, kernel_size=3, padding=1).double()
+    x = torch.randn(4, 2, 5, 5, dtype=torch.float64)
+    weight_dot = torch.randn_like(layer.weight)
+
+    base = layer(x)
+    output = run_with_dual_parameter(layer, "weight", weight_dot, x)
+
+    h = 1e-6
+    with torch.no_grad():
+        layer.weight.add_(h * weight_dot)
+        plus = layer(x)
+        layer.weight.add_(-2 * h * weight_dot)
+        minus = layer(x)
+        layer.weight.add_(h * weight_dot)
+    fd = (plus - minus) / (2 * h)
+
+    assert torch.allclose(primal(output), base)
+    assert torch.allclose(tangent(output), fd, rtol=1e-6, atol=1e-6)
+    assert primal(output).requires_grad
+    assert primal(output).grad_fn is not None
+    _assert_graph_free(tangent(output))
+
+
+def test_conv2d_bias_dual_matches_finite_difference() -> None:
+    torch.manual_seed(14)
+    layer = nn.Conv2d(2, 3, kernel_size=3, padding=1).double()
+    x = torch.randn(4, 2, 5, 5, dtype=torch.float64)
+    bias_dot = torch.randn_like(layer.bias)
+
+    base = layer(x)
+    output = run_with_dual_parameter(layer, "bias", bias_dot, x)
+
+    h = 1e-6
+    with torch.no_grad():
+        layer.bias.add_(h * bias_dot)
+        plus = layer(x)
+        layer.bias.add_(-2 * h * bias_dot)
+        minus = layer(x)
+        layer.bias.add_(h * bias_dot)
+    fd = (plus - minus) / (2 * h)
+
+    assert torch.allclose(primal(output), base)
+    assert torch.allclose(tangent(output), fd, rtol=1e-6, atol=1e-6)
+    _assert_graph_free(tangent(output))
+
+
+def test_batch_norm2d_training_input_dual_matches_finite_difference() -> None:
+    torch.manual_seed(15)
+    x = torch.randn(4, 3, 5, 5, dtype=torch.float64)
+    x_dot = torch.randn_like(x)
+    weight = torch.randn(3, dtype=torch.float64)
+    bias = torch.randn(3, dtype=torch.float64)
+    eps = 1e-5
+
+    def fn(x_value: torch.Tensor) -> torch.Tensor:
+        return torch.ops.aten.native_batch_norm.default(
+            x_value,
+            weight,
+            bias,
+            None,
+            None,
+            True,
+            0.1,
+            eps,
+        )[0]
+
+    output = fn(make_dual(x, x_dot))
+    fd = _central_difference(fn, (x,), (x_dot,))
+
+    assert torch.allclose(primal(output), fn(x))
+    assert torch.allclose(tangent(output), fd, rtol=1e-5, atol=1e-6)
+    _assert_graph_free(tangent(output))
+
+
+def test_batch_norm2d_training_weight_dual_matches_finite_difference() -> None:
+    torch.manual_seed(9)
+    baseline = nn.BatchNorm2d(3).double().train()
+    model = nn.BatchNorm2d(3).double().train()
+    initial_state = copy.deepcopy(baseline.state_dict())
+    model.load_state_dict(initial_state)
+    x = torch.randn(4, 3, 5, 5, dtype=torch.float64)
+    weight_dot = torch.randn_like(model.weight)
+
+    base = baseline(x)
+    output = run_with_dual_parameter(model, "weight", weight_dot, x)
+
+    def forward_with_weight_offset(offset: float) -> torch.Tensor:
+        candidate = nn.BatchNorm2d(3).double().train()
+        candidate.load_state_dict(initial_state)
+        with torch.no_grad():
+            candidate.weight.add_(offset * weight_dot)
+            return candidate(x)
+
+    h = 1e-6
+    fd = (forward_with_weight_offset(h) - forward_with_weight_offset(-h)) / (2 * h)
+
+    assert torch.allclose(primal(output), base)
+    assert torch.allclose(tangent(output), fd, rtol=1e-6, atol=1e-6)
+    assert torch.allclose(model.running_mean, baseline.running_mean)
+    assert torch.allclose(model.running_var, baseline.running_var)
+    _assert_graph_free(tangent(output))
+
+
+def test_max_pool2d_dual_uses_primal_argmax_locations() -> None:
+    x = torch.arange(1, 17, dtype=torch.float64).reshape(1, 1, 4, 4)
+    x_dot = torch.randn_like(x)
+
+    def fn(x_value: torch.Tensor) -> torch.Tensor:
+        return F.max_pool2d(x_value, kernel_size=2, stride=2).sum()
+
+    output = fn(make_dual(x, x_dot))
+    fd = _central_difference(fn, (x,), (x_dot,))
+
+    assert torch.allclose(primal(output), fn(x))
+    assert torch.allclose(tangent(output), fd, rtol=1e-6, atol=1e-6)
+    _assert_graph_free(tangent(output))
+
+
 def test_toy_mlp_single_dual_parameter_matches_finite_difference() -> None:
     torch.manual_seed(4)
     model = nn.Sequential(
@@ -188,6 +311,80 @@ def test_toy_mlp_single_dual_parameter_matches_finite_difference() -> None:
     assert torch.allclose(tangent(output), fd, rtol=1e-5, atol=1e-6)
     assert primal(output).requires_grad
     assert primal(output).grad_fn is not None
+    _assert_graph_free(tangent(output))
+
+
+def test_cnn_forward_dual_composes_through_primitives() -> None:
+    torch.manual_seed(10)
+    model = nn.Sequential(
+        nn.Conv2d(3, 4, kernel_size=3, padding=1),
+        nn.BatchNorm2d(4),
+        nn.ReLU(),
+        nn.AvgPool2d(kernel_size=2),
+        nn.Conv2d(4, 5, kernel_size=3, padding=1),
+        nn.ReLU(),
+        nn.AdaptiveAvgPool2d((1, 1)),
+        nn.Flatten(),
+        nn.Linear(5, 2),
+    ).double()
+    model.eval()
+    x = torch.randn(2, 3, 8, 8, dtype=torch.float64)
+    weight_dot = torch.randn_like(model[0].weight)
+
+    base = model(x)
+    output = run_with_dual_parameter(model, "0.weight", weight_dot, x)
+
+    h = 1e-6
+    with torch.no_grad():
+        model[0].weight.add_(h * weight_dot)
+        plus = model(x)
+        model[0].weight.add_(-2 * h * weight_dot)
+        minus = model(x)
+        model[0].weight.add_(h * weight_dot)
+    fd = (plus - minus) / (2 * h)
+
+    assert torch.allclose(primal(output), base)
+    assert torch.allclose(tangent(output), fd, rtol=1e-5, atol=1e-6)
+    assert primal(output).requires_grad
+    assert primal(output).grad_fn is not None
+    _assert_graph_free(tangent(output))
+
+
+def test_resnet_like_forward_dual_composes_through_residual_add() -> None:
+    class TinyResidualBlock(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv1 = nn.Conv2d(3, 4, kernel_size=3, padding=1)
+            self.bn1 = nn.BatchNorm2d(4)
+            self.relu = nn.ReLU()
+            self.conv2 = nn.Conv2d(4, 3, kernel_size=3, padding=1)
+            self.bn2 = nn.BatchNorm2d(3)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            residual = x
+            out = self.relu(self.bn1(self.conv1(x)))
+            out = self.bn2(self.conv2(out))
+            return self.relu(out + residual)
+
+    torch.manual_seed(13)
+    model = TinyResidualBlock().double().eval()
+    x = torch.randn(2, 3, 6, 6, dtype=torch.float64)
+    weight_dot = torch.randn_like(model.conv2.weight)
+
+    base = model(x)
+    output = run_with_dual_parameter(model, "conv2.weight", weight_dot, x)
+
+    h = 1e-6
+    with torch.no_grad():
+        model.conv2.weight.add_(h * weight_dot)
+        plus = model(x)
+        model.conv2.weight.add_(-2 * h * weight_dot)
+        minus = model(x)
+        model.conv2.weight.add_(h * weight_dot)
+    fd = (plus - minus) / (2 * h)
+
+    assert torch.allclose(primal(output), base)
+    assert torch.allclose(tangent(output), fd, rtol=1e-5, atol=1e-6)
     _assert_graph_free(tangent(output))
 
 

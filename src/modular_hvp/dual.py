@@ -384,6 +384,22 @@ def _zero_scalar_like(value: torch.Tensor) -> torch.Tensor:
     return value.new_zeros(())
 
 
+def _reshape_channel_tangent(value: torch.Tensor, ndim: int) -> torch.Tensor:
+    if value.ndim != 1:
+        return value
+    return value.reshape((1, value.shape[0], *([1] * (ndim - 2))))
+
+
+def _channel_reduction_dims(value: torch.Tensor) -> tuple[int, ...]:
+    if value.dim() < 2:
+        raise NotImplementedError("channel-wise normalization expects at least 2 dims")
+    return tuple(dim for dim in range(value.dim()) if dim != 1)
+
+
+def _channel_mean(value: torch.Tensor) -> torch.Tensor:
+    return value.mean(dim=_channel_reduction_dims(value))
+
+
 def _apply_same_unary_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
     if args and _is_zero_primal(args[0]):
         with torch.no_grad():
@@ -735,6 +751,271 @@ def _linear_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Du
     return _make_rule_output(primal_output, tangent_output)
 
 
+def _convolution_rule(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> DualTensor:
+    (
+        input_value,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        transposed,
+        output_padding,
+        groups,
+    ) = args[:9]
+    input_p, input_t, input_is_dual = _split(input_value)
+    weight_p, weight_t, weight_is_dual = _split(weight)
+    bias_p, bias_t, bias_is_dual = _split(bias)
+    primal_output = _call_primal(
+        func,
+        input_p,
+        weight_p,
+        bias_p,
+        stride,
+        padding,
+        dilation,
+        transposed,
+        output_padding,
+        groups,
+        **kwargs,
+    )
+
+    with torch.no_grad():
+        input_ng = input_p.detach()
+        weight_ng = weight_p.detach()
+        tangent_output = _add_terms(
+            _map_tangent(
+                lambda item: func(
+                    item,
+                    weight_ng,
+                    None,
+                    stride,
+                    padding,
+                    dilation,
+                    transposed,
+                    output_padding,
+                    groups,
+                    **kwargs,
+                ),
+                input_t,
+            )
+            if input_is_dual
+            else None,
+            _map_tangent(
+                lambda item: func(
+                    input_ng,
+                    item,
+                    None,
+                    stride,
+                    padding,
+                    dilation,
+                    transposed,
+                    output_padding,
+                    groups,
+                    **kwargs,
+                ),
+                weight_t,
+            )
+            if weight_is_dual
+            else None,
+        )
+        if bias_is_dual:
+            bias_tangent = _reshape_channel_tangent(bias_t, primal_output.dim())
+            tangent_output = (
+                bias_tangent
+                if tangent_output is None
+                else tangent_output + bias_tangent
+            )
+        if tangent_output is None:
+            tangent_output = torch.zeros_like(primal_output.detach())
+    return _make_rule_output(primal_output, tangent_output)
+
+
+def _native_batch_norm_rule(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[DualTensor, DualTensor, DualTensor]:
+    (
+        input_value,
+        weight,
+        bias,
+        running_mean,
+        running_var,
+        training,
+        momentum,
+        eps,
+    ) = args[:8]
+    input_p, input_t, input_is_dual = _split(input_value)
+    weight_p, weight_t, weight_is_dual = _split(weight)
+    bias_p, bias_t, bias_is_dual = _split(bias)
+    if is_dual(running_mean) or is_dual(running_var):
+        raise NotImplementedError(
+            "DualTensor rule not implemented for dual BatchNorm running statistics"
+        )
+    running_mean_p = primal(running_mean)
+    running_var_p = primal(running_var)
+
+    if _IN_TANGENT_EVAL.get():
+        primal_output, save_mean, save_invstd = _batch_norm_primal_no_stats_update(
+            input_p,
+            weight_p,
+            bias_p,
+            running_mean_p,
+            running_var_p,
+            training,
+            eps,
+        )
+    else:
+        primal_output, save_mean, save_invstd = _call_primal(
+            func,
+            input_p,
+            weight_p,
+            bias_p,
+            running_mean_p,
+            running_var_p,
+            training,
+            momentum,
+            eps,
+            **kwargs,
+        )
+
+    with torch.no_grad():
+        tangent_output, save_mean_tangent, save_invstd_tangent = _batch_norm_tangent(
+            input_p,
+            input_t if input_is_dual else None,
+            weight_p,
+            weight_t if weight_is_dual else None,
+            bias_t if bias_is_dual else None,
+            running_mean_p,
+            running_var_p,
+            save_mean,
+            save_invstd,
+            training,
+            eps,
+        )
+    return (
+        _make_rule_output(primal_output, tangent_output),
+        _make_rule_output(save_mean, save_mean_tangent),
+        _make_rule_output(save_invstd, save_invstd_tangent),
+    )
+
+
+def _batch_norm_primal_no_stats_update(
+    input_value: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    running_mean: torch.Tensor | None,
+    running_var: torch.Tensor | None,
+    training: bool,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        input_ng = input_value.detach()
+        if training:
+            mean = _channel_mean(input_ng)
+            centered = input_ng - _reshape_channel_tangent(mean, input_ng.dim())
+            var = _channel_mean(centered * centered)
+            invstd = torch.rsqrt(var + eps)
+        else:
+            if running_mean is None or running_var is None:
+                raise RuntimeError("BatchNorm eval requires running statistics")
+            mean = running_mean.detach()
+            invstd = torch.rsqrt(running_var.detach() + eps)
+
+        normalized = (
+            input_ng - _reshape_channel_tangent(mean, input_ng.dim())
+        ) * _reshape_channel_tangent(invstd, input_ng.dim())
+        output = normalized
+        if weight is not None:
+            output = output * _reshape_channel_tangent(weight.detach(), input_ng.dim())
+        if bias is not None:
+            output = output + _reshape_channel_tangent(bias.detach(), input_ng.dim())
+
+        if training:
+            save_mean = mean
+            save_invstd = invstd
+        else:
+            save_mean = input_ng.new_empty((0,))
+            save_invstd = input_ng.new_empty((0,))
+    return output, save_mean, save_invstd
+
+
+def _batch_norm_tangent(
+    input_value: torch.Tensor,
+    input_tangent: torch.Tensor | None,
+    weight: torch.Tensor | None,
+    weight_tangent: torch.Tensor | None,
+    bias_tangent: torch.Tensor | None,
+    running_mean: torch.Tensor | None,
+    running_var: torch.Tensor | None,
+    save_mean: torch.Tensor,
+    save_invstd: torch.Tensor,
+    training: bool,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    input_ng = input_value.detach()
+    ndim = input_ng.dim()
+
+    if training:
+        mean = save_mean.detach()
+        invstd = save_invstd.detach()
+        centered = input_ng - _reshape_channel_tangent(mean, ndim)
+        normalized = centered * _reshape_channel_tangent(invstd, ndim)
+
+        if input_tangent is None:
+            mean_tangent = torch.zeros_like(mean)
+            invstd_tangent = torch.zeros_like(invstd)
+            normalized_tangent = torch.zeros_like(input_ng)
+        else:
+            # Training BatchNorm JVP: mean, variance, and invstd all depend on x.
+            mean_tangent = _channel_mean(input_tangent)
+            centered_tangent = input_tangent - _reshape_channel_tangent(
+                mean_tangent,
+                ndim,
+            )
+            var_tangent = _channel_mean(2 * centered * centered_tangent)
+            invstd_tangent = -0.5 * invstd.pow(3) * var_tangent
+            normalized_tangent = (
+                centered_tangent * _reshape_channel_tangent(invstd, ndim)
+                + centered * _reshape_channel_tangent(invstd_tangent, ndim)
+            )
+    else:
+        if running_mean is None or running_var is None:
+            raise RuntimeError("BatchNorm eval requires running statistics")
+        mean = running_mean.detach()
+        invstd = torch.rsqrt(running_var.detach() + eps)
+        centered = input_ng - _reshape_channel_tangent(mean, ndim)
+        normalized = centered * _reshape_channel_tangent(invstd, ndim)
+        normalized_tangent = (
+            torch.zeros_like(input_ng)
+            if input_tangent is None
+            else input_tangent * _reshape_channel_tangent(invstd, ndim)
+        )
+        mean_tangent = torch.zeros_like(save_mean)
+        invstd_tangent = torch.zeros_like(save_invstd)
+
+    output_tangent = normalized_tangent
+    if weight is not None:
+        output_tangent = output_tangent * _reshape_channel_tangent(
+            weight.detach(),
+            ndim,
+        )
+    if weight_tangent is not None:
+        output_tangent = output_tangent + normalized * _reshape_channel_tangent(
+            weight_tangent,
+            ndim,
+        )
+    if bias_tangent is not None:
+        output_tangent = output_tangent + _reshape_channel_tangent(bias_tangent, ndim)
+
+    return output_tangent, mean_tangent, invstd_tangent
+
+
 def _reduction_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
     value = args[0]
     if _is_zero_primal(value):
@@ -757,6 +1038,39 @@ def _reduction_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) ->
             )
         )
     return _make_rule_output(primal_output, tangent_output)
+
+
+def _max_pool2d_with_indices_rule(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[DualTensor, torch.Tensor]:
+    input_value = args[0]
+    input_p, input_t, input_is_dual = _split(input_value)
+    primal_output, indices = _call_primal(func, input_p, *args[1:], **kwargs)
+    with torch.no_grad():
+        if input_is_dual:
+            tangent_output = _max_pool2d_tangent(input_t, indices)
+        else:
+            tangent_output = torch.zeros_like(primal_output.detach())
+    return _make_rule_output(primal_output, tangent_output), indices
+
+
+def _max_pool2d_tangent(
+    input_tangent: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    if input_tangent.dim() == 3:
+        channels, _, _ = input_tangent.shape
+        flat_tangent = input_tangent.reshape(channels, -1)
+        flat_indices = indices.reshape(channels, -1)
+        return flat_tangent.gather(1, flat_indices).reshape(indices.shape)
+    if input_tangent.dim() == 4:
+        batch, channels, _, _ = input_tangent.shape
+        flat_tangent = input_tangent.reshape(batch, channels, -1)
+        flat_indices = indices.reshape(batch, channels, -1)
+        return flat_tangent.gather(2, flat_indices).reshape(indices.shape)
+    raise NotImplementedError("max_pool2d tangent expects a 3D or 4D input")
 
 
 def _relu_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
@@ -996,6 +1310,8 @@ for _name in ("mm", "matmul", "bmm"):
     _register(_name, "default", _matmul_rule)
 _register("addmm", "default", _addmm_rule)
 _register("linear", "default", _linear_rule)
+_register("convolution", "default", _convolution_rule)
+_register("native_batch_norm", "default", _native_batch_norm_rule)
 
 for _name, _overload in (
     ("sum", "default"),
@@ -1026,9 +1342,12 @@ for _name, _overload in (
     ("to", "dtype_layout"),
     ("_to_copy", "default"),
     ("detach", "default"),
+    ("avg_pool2d", "default"),
+    ("_adaptive_avg_pool2d", "default"),
 ):
     _register(_name, _overload, _apply_same_unary_rule)
 
+_register("max_pool2d_with_indices", "default", _max_pool2d_with_indices_rule)
 _register("relu", "default", _relu_rule)
 _register("threshold_backward", "default", _threshold_backward_rule)
 _register("gelu", "default", _gelu_rule)

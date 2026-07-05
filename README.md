@@ -25,6 +25,10 @@ Current implementation status:
 - The primitive `DualTensor` backend implements the operator-overloading layer
   used by lower-level forward-mode tests and by the current local backward
   tensor programs.
+- The primitive backend can dualize CNN/ResNet-style forward tensor programs
+  composed from convolution, BatchNorm, pooling, ReLU, residual addition, shape
+  ops, and linear layers. This is backend coverage only; the default public HVP
+  runtime is still the Linear/ReLU/MSE scope above.
 - `DualTensor.primal` preserves ordinary PyTorch autograd graph construction.
   `DualTensor.tangent` is exactly one tensor, detached at construction. Every
   primitive tangent rule runs as a no-grad side channel using detached primal
@@ -169,11 +173,22 @@ rules, not by special-casing architecture motifs. For example, ResNet residual
 connections are just ordinary tensor addition (`x + f(x)`), so `aten.add` is
 the primitive rule; there should be no residual-specific rule.
 
+Implemented CNN/ResNet forward primitives:
+
+- `aten.convolution`: JVP uses
+  `conv(x_dot, W) + conv(x, W_dot) + b_dot`.
+- `aten.native_batch_norm`: training-mode JVP includes the tangent of batch
+  mean, variance, and inverse standard deviation; eval-mode treats running
+  statistics as constants.
+- `aten.avg_pool2d` and `aten._adaptive_avg_pool2d`: linear same-op tangent
+  rules.
+- `aten.max_pool2d_with_indices`: tangent gathers from `x_dot` at the primal
+  argmax indices.
+- ResNet residual paths continue to use existing `aten.add`; there is no
+  residual-specific rule.
+
 Expected next primitive families:
 
-- ResNet/CNN forward: `aten.convolution`, `aten.native_batch_norm`,
-  pooling ops such as max/adaptive average pool, plus existing `aten.add`,
-  `aten.relu`, shape/view ops, and linear ops.
 - ResNet/CNN backward-like programs: convolution backward primitives,
   batch-norm backward primitives, pooling backward primitives, and existing
   activation/linear backward primitives.
