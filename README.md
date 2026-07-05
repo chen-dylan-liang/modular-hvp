@@ -21,14 +21,18 @@ for name, p in model.named_parameters():
 Current implementation status:
 
 - The default `modular_hvp(...)` context computes per-parameter block HVPs for
-  Linear/ReLU MLPs with MSE loss using local dual activations.
+  supported single-chain `nn.Sequential` networks with MSE loss using local
+  dual activations. Supported leaf modules currently include `Linear`,
+  `Conv2d`, eval-mode `BatchNorm2d`, `ReLU`, `Flatten`, `AvgPool2d`,
+  `AdaptiveAvgPool2d`, and `MaxPool2d`.
 - The primitive `DualTensor` backend implements the operator-overloading layer
   used by lower-level forward-mode tests and by the current local backward
   tensor programs.
 - The primitive backend can dualize CNN/ResNet-style forward tensor programs
   composed from convolution, BatchNorm, pooling, ReLU, residual addition, shape
-  ops, and linear layers. This is backend coverage only; the default public HVP
-  runtime is still the Linear/ReLU/MSE scope above.
+  ops, and linear layers. Public HVP runtime support for true residual/DAG
+  models is not enabled yet; that requires graph-indexed backward traversal
+  rather than adding residual-specific rules.
 - `DualTensor.primal` preserves ordinary PyTorch autograd graph construction.
   `DualTensor.tangent` is exactly one tensor, detached at construction. Every
   primitive tangent rule runs as a no-grad side channel using detached primal
@@ -106,14 +110,19 @@ uses keyed `DualTensor` payloads to carry multiple epsilons through the forward
 program. The primitive backend remains the only place where tensor operations
 are overloaded.
 
-The current backward side is still the narrow MLP/MSE milestone, not the final
-general backward-hook runtime. The loss hook initializes the model-output
+The current backward side is still a single-chain runtime, not the final
+general DAG backward-hook runtime. The loss hook initializes the model-output
 curvature action for MSE, and activation hooks apply that action to each saved
 local dual activation as ordinary PyTorch backward reaches the matching block.
-The narrow MLP path still has Linear/ReLU/MSE-specific hook plumbing; the
-primitive `DualTensor` backend itself remains single-tangent and ATen-scoped.
+The current single-chain runtime has module-record plumbing for the supported
+Linear/CNN leaf modules; the primitive `DualTensor` backend itself remains
+single-tangent and ATen-scoped.
 
 - Linear backward-side pieces use `aten.mm`, `aten.t`, and `aten.sum`.
+- Conv2d backward-side pieces use `aten.convolution` and
+  `aten.convolution_backward`.
+- Eval BatchNorm2d backward-side pieces use `aten.native_batch_norm_backward`.
+- Pooling backward-side pieces use ATen pool backward primitives.
 - ReLU dispatches as `aten.relu.default`; its backward-side program uses
   `aten.threshold_backward.default`.
 - MSE loss dispatches as ordinary PyTorch `mse_loss`; the local runtime only
@@ -149,6 +158,41 @@ mean the method is slower or uses more peak RSS than `modular_hvp`.
 | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 99.989 ms | 1.55x | 366.73 MiB | 1.83x |
 | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 110.823 ms | 1.72x | 256.54 MiB | 1.28x |
 | `torch_backward` | n/a | n/a | 13.342 ms | 0.21x | 182.04 MiB | 0.91x |
+
+## Toy CNN Comparison
+
+The CNN comparison uses the same public `modular_hvp(...)` interface and the
+same BackPACK baselines on a single-chain Conv/ReLU/AvgPool/Conv/ReLU/Flatten
+toy CNN:
+
+```bash
+uv run python benchmarks/compare_toy_cnn.py \
+  --batch-size 64 --image-size 16 --width 16 --d-out 10 \
+  --dtype float32 --warmup 1 --repeats 3
+```
+
+Ratio columns compare each method against `modular_hvp`; values above `1.0x`
+mean the method is slower or uses more peak RSS than `modular_hvp`.
+
+| Method | Max abs error | Max rel error | Mean time | Time vs `modular_hvp` | Median peak RSS | Peak RSS vs `modular_hvp` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `modular_hvp` | 0.000e+00 | 0.000e+00 | 14.400 ms | 1.00x | 176.95 MiB | 1.00x |
+| `backpack_hmp` | 3.353e-08 | 9.943e-07 | 43.837 ms | 3.04x | 273.64 MiB | 1.55x |
+| `backpack_autodiff` | 2.980e-08 | 1.967e-07 | 27.353 ms | 1.90x | 227.98 MiB | 1.29x |
+| `torch_backward` | n/a | n/a | 4.163 ms | 0.29x | 171.16 MiB | 0.97x |
+
+BackPACK baseline limitations observed while setting up CNN comparisons:
+
+- BackPACK HMP works on the float32 toy CNN above, but the same Conv/ReLU/
+  AvgPool/Flatten/Linear HMP path failed locally in float64 with an internal
+  dtype mismatch.
+- BackPACK HMP does not currently provide an HMP extension for
+  `nn.BatchNorm2d`; the local `modular_hvp` runtime supports eval-mode
+  `BatchNorm2d` in sequential CNNs and tests it against per-parameter autodiff
+  HVPs.
+- BackPACK's reverse-over-reverse autodiff HVP utility remained usable for
+  these toy CNN checks, but it keeps the expected reverse-over-reverse cost
+  profile.
 
 ## Depth Sweep
 
