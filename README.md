@@ -26,15 +26,22 @@ Current implementation status:
   used by lower-level forward-mode tests and by the current local backward
   tensor programs.
 - `DualTensor.primal` preserves ordinary PyTorch autograd graph construction.
-  `DualTensor.tangent` is detached at construction and every primitive tangent
-  rule runs as a no-grad side channel using detached primal values.
-- The runtime keeps the user-visible forward path ordinary. Internally, it uses
-  a keyed side-channel of `DualTensor` tangents: each parameter block has its
-  own key, keys are never summed into a global tangent, and only primal tensors
-  are returned to user code.
+  `DualTensor.tangent` is exactly one tensor, detached at construction. Every
+  primitive tangent rule runs as a no-grad side channel using detached primal
+  values.
+- Python-level wrappers such as `linear`, `relu`, and `matmul` are not
+  registered as separate backend rules. They are allowed to lower into ATen,
+  where the primitive `DualTensor` rules run.
+- The runtime keeps the user-visible forward path ordinary. For each active
+  parameter block, the owning module consumes that parameter's tangent locally,
+  saves the resulting local dual activation, and returns only the primal output
+  to downstream modules.
+- Local epsilons are not represented as keyed `DualTensor` channels and are not
+  exported across forward block boundaries.
 - During backward, tensor hooks at saved activation boundaries consume the
-  keyed side-channel as PyTorch's ordinary backward reaches that block. HVPs are
-  written into the single public `p.hvp` field during that same backward pass.
+  saved local dual activations as PyTorch's ordinary backward reaches the
+  matching block. HVPs are written into the single public `p.hvp` field during
+  that same backward pass.
 - The generic hook-plumbing runtime remains available as an internal extension
   point for future optimized dualized-backward integration.
 
@@ -80,45 +87,27 @@ RSS is a coarse process-level measurement, so tiny toy runs can be noisy; deeper
 stress settings make the memory differences more visible. The table reports
 median average RSS, median peak RSS, and max peak RSS across measured repeats.
 
-Recorded CPU runs:
-
-| Setting | Command | Shape |
-| --- | --- | --- |
-| Toy 4-layer MLP | `uv run python benchmarks/compare_toy_mlp.py --batch-size 512 --d-in 784 --d-hidden 512 --hidden-layers 4 --d-out 10 --dtype float32 --warmup 2 --repeats 8` | batch 512, input 784, hidden width 512, 4 hidden Linear/ReLU blocks, output 10, float32 |
-| Deep stress 50-layer MLP | `uv run python benchmarks/compare_toy_mlp.py --batch-size 256 --d-in 784 --d-hidden 512 --hidden-layers 50 --d-out 10 --dtype float32 --warmup 1 --repeats 3` | batch 256, input 784, hidden width 512, 50 hidden Linear/ReLU blocks, output 10, float32 |
-
-Latest local results:
-
 For `backpack_hmp`, BackPACK's `extend(...)` setup is performed before the
 timed region. The measured region contains the forward pass, BackPACK HMP
 backward pass, and one `param.hmp(...)` application per parameter.
 
-The current `modular_hvp` implementation is correct on these MLP benchmarks,
-and follows the block-scoped invariant: each parameter tangent is keyed to its
-own parameter block, never summed with neighboring blocks, and contributes only
-to that parameter's public `p.hvp`. Reused parameters accumulate into that same
-`p.hvp`; the current shared-parameter path uses a correctness fallback.
+The current `modular_hvp` implementation follows the block-scoped forward
+locality invariant: parameter tangents are consumed inside the owning module,
+the local dual activation is saved, and only the primal output is passed to the
+rest of the model. Reused parameters accumulate into the same `p.hvp`; the
+current shared-parameter path uses a correctness fallback.
 
-The local runtime does not compute a full HVP and slice it. It uses a
-block-keyed side-channel so different parameter epsilons can pass through the
-same primitive tensor program without being combined into one model-wide
-tangent.
-
-The forward side does not reimplement module math and does not replay once per
-parameter. For an active owning module, the runtime calls the module's original
-`forward` once with local `DualTensor` parameters. PyTorch decomposes that code
-to ATen as usual; the `DualTensor` backend only changes behavior when an ATen
-primitive receives a dual input. The resulting tangent payload is keyed by
-parameter, so `dy_weight` and `dy_bias` remain separate local epsilons instead
-of being summed into a global tangent.
+The local runtime does not compute a full HVP and slice it. It also no longer
+uses keyed `DualTensor` payloads to carry multiple epsilons through the forward
+program. The primitive backend remains the only place where tensor operations
+are overloaded.
 
 The current backward side is still the narrow MLP/MSE milestone, not the final
-general backward-hook runtime. It no longer runs repeated per-parameter suffix
-applications from the loss hook. Instead, the loss hook initializes the
-model-output curvature side-channel, and activation hooks consume and propagate
-that side-channel as ordinary PyTorch backward reaches each block. The tensor
-programs are expressed through ATen primitives and run through the `DualTensor`
-registry:
+general backward-hook runtime. The loss hook initializes the model-output
+curvature action for MSE, and activation hooks apply that action to each saved
+local dual activation as ordinary PyTorch backward reaches the matching block.
+The narrow MLP path still has Linear/ReLU/MSE-specific hook plumbing; the
+primitive `DualTensor` backend itself remains single-tangent and ATen-scoped.
 
 - Linear backward-side pieces use `aten.mm`, `aten.t`, and `aten.sum`.
 - ReLU dispatches as `aten.relu.default`; its backward-side program uses
@@ -131,22 +120,31 @@ For Linear and ReLU activation values needed by the local backward-side tensor
 programs, the MLP runtime resolves tensors already saved by PyTorch autograd and
 releases the autograd-node reference inside the hook. It falls back to an
 explicit detached activation only when the expected saved tensor is unavailable.
+Saved local output tangents are cleared immediately after their owning backward
+hook consumes them.
 
 The backend has explicit graph-isolation tests: primal outputs keep
 `requires_grad` and `grad_fn`, while tangent outputs have
 `requires_grad == False` and `grad_fn is None`, even when the input tangent was
 created with `requires_grad=True`.
 
-| Setting | Method | Max abs error | Max rel error | Mean time | Median avg RSS | Median peak RSS | Max peak RSS |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Toy 4-layer | `modular_hvp` | 0.000e+00 | 0.000e+00 | 71.886 ms | 193.99 MiB | 200.92 MiB | 201.12 MiB |
-| Toy 4-layer | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 76.389 ms | 357.83 MiB | 366.68 MiB | 460.75 MiB |
-| Toy 4-layer | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 87.405 ms | 248.85 MiB | 256.59 MiB | 256.86 MiB |
-| Toy 4-layer | `torch_backward` | n/a | n/a | 8.446 ms | 182.01 MiB | 182.01 MiB | 182.10 MiB |
-| Deep stress 50-layer | `modular_hvp` | 0.000e+00 | 0.000e+00 | 13003.740 ms | 401.54 MiB | 431.33 MiB | 431.98 MiB |
-| Deep stress 50-layer | `backpack_hmp` | 7.451e-09 | 1.206e-06 | 14258.464 ms | 906.65 MiB | 936.36 MiB | 1.11 GiB |
-| Deep stress 50-layer | `backpack_autodiff` | 7.451e-09 | 7.954e-07 | 14908.764 ms | 433.74 MiB | 478.16 MiB | 478.46 MiB |
-| Deep stress 50-layer | `torch_backward` | n/a | n/a | 97.658 ms | 302.61 MiB | 327.02 MiB | 327.31 MiB |
+Current 4-layer toy MLP result:
+
+```bash
+uv run python benchmarks/compare_toy_mlp.py \
+  --batch-size 512 --d-in 784 --d-hidden 512 --hidden-layers 4 --d-out 10 \
+  --dtype float32 --warmup 2 --repeats 8
+```
+
+Ratio columns compare each method against `modular_hvp`; values above `1.0x`
+mean the method is slower or uses more peak RSS than `modular_hvp`.
+
+| Method | Max abs error | Max rel error | Mean time | Time vs `modular_hvp` | Median peak RSS | Peak RSS vs `modular_hvp` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `modular_hvp` | 0.000e+00 | 0.000e+00 | 64.577 ms | 1.00x | 200.91 MiB | 1.00x |
+| `backpack_hmp` | 3.725e-09 | 4.425e-07 | 99.989 ms | 1.55x | 366.73 MiB | 1.83x |
+| `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 110.823 ms | 1.72x | 256.54 MiB | 1.28x |
+| `torch_backward` | n/a | n/a | 13.342 ms | 0.21x | 182.04 MiB | 0.91x |
 
 ## Depth Sweep
 
@@ -160,26 +158,33 @@ uv run python benchmarks/depth_sweep_mlp.py \
   --dtype float32 --warmup 1 --repeats 3
 ```
 
-The script writes the raw data to
-`benchmarks/results/depth_sweep_width256.json` and the trend figure to
-`benchmarks/results/depth_sweep_width256.png`.
+The script writes raw data and a trend figure to `benchmarks/results/`. No
+checked-in depth sweep result is kept right now because the runtime semantics
+changed from keyed forward channels to strict local forward activation records.
 
-![Width-256 MLP depth sweep](benchmarks/results/depth_sweep_width256.png)
+## Primitive Coverage Roadmap
 
-| Depth | Method | Max abs error | Max rel error | Mean time | Median avg RSS | Median peak RSS |
-| ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| 10 | `modular_hvp` | 0.000e+00 | 0.000e+00 | 0.122 s | 210.91 MiB | 215.27 MiB |
-| 10 | `backpack_hmp` | 3.725e-09 | 7.478e-07 | 0.172 s | 256.96 MiB | 262.74 MiB |
-| 10 | `backpack_autodiff` | 3.725e-09 | 8.012e-07 | 0.149 s | 258.97 MiB | 266.88 MiB |
-| 25 | `modular_hvp` | 0.000e+00 | 0.000e+00 | 0.743 s | 233.85 MiB | 246.14 MiB |
-| 25 | `backpack_hmp` | 1.490e-08 | 1.122e-06 | 1.053 s | 337.60 MiB | 351.11 MiB |
-| 25 | `backpack_autodiff` | 1.490e-08 | 1.122e-06 | 0.987 s | 279.00 MiB | 297.67 MiB |
-| 50 | `modular_hvp` | 0.000e+00 | 0.000e+00 | 3.786 s | 275.30 MiB | 298.59 MiB |
-| 50 | `backpack_hmp` | 1.490e-08 | 8.969e-07 | 5.628 s | 477.61 MiB | 499.40 MiB |
-| 50 | `backpack_autodiff` | 1.490e-08 | 8.969e-07 | 5.295 s | 320.11 MiB | 349.87 MiB |
-| 75 | `modular_hvp` | 0.000e+00 | 0.000e+00 | 16.721 s | 319.03 MiB | 349.80 MiB |
-| 75 | `backpack_hmp` | 5.588e-09 | 1.006e-06 | 24.026 s | 445.45 MiB | 529.23 MiB |
-| 75 | `backpack_autodiff` | 5.588e-09 | 1.006e-06 | 24.802 s | 364.70 MiB | 401.50 MiB |
-| 100 | `modular_hvp` | 0.000e+00 | 0.000e+00 | 37.764 s | 365.11 MiB | 403.32 MiB |
-| 100 | `backpack_hmp` | 2.980e-08 | 9.094e-07 | 47.471 s | 750.78 MiB | 794.26 MiB |
-| 100 | `backpack_autodiff` | 2.980e-08 | 9.094e-07 | 61.244 s | 393.50 MiB | 454.02 MiB |
+Architecture support should be added by extending ATen-level `DualTensor`
+rules, not by special-casing architecture motifs. For example, ResNet residual
+connections are just ordinary tensor addition (`x + f(x)`), so `aten.add` is
+the primitive rule; there should be no residual-specific rule.
+
+Expected next primitive families:
+
+- ResNet/CNN forward: `aten.convolution`, `aten.native_batch_norm`,
+  pooling ops such as max/adaptive average pool, plus existing `aten.add`,
+  `aten.relu`, shape/view ops, and linear ops.
+- ResNet/CNN backward-like programs: convolution backward primitives,
+  batch-norm backward primitives, pooling backward primitives, and existing
+  activation/linear backward primitives.
+- Transformer unfused path: existing linear/matmul/bmm/view/transpose/add/mul/div
+  rules, plus `aten._softmax`, softmax backward, `aten.native_layer_norm`,
+  layer-norm backward, GELU backward, dropout primitives, and indexing/select
+  backward where they appear.
+- Transformer fused path: if PyTorch dispatch reaches fused ATen ops such as
+  scaled-dot-product attention or transformer fastpath kernels, treat those as
+  atomic primitives only when they actually appear at dispatch. Do not replace
+  them with module-level attention or transformer rules.
+
+Each added primitive should get a focused finite-difference test and then a
+small composition test for the target architecture.

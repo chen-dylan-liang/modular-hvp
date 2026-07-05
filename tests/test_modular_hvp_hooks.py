@@ -208,7 +208,7 @@ def test_default_runtime_uses_autograd_saved_activation_refs() -> None:
     assert relu_ref.grad_fn is None
 
 
-def test_default_modular_hvp_passes_dual_parameters_to_forward() -> None:
+def test_default_modular_hvp_consumes_local_dual_parameter_in_forward() -> None:
     class InspectLinear(nn.Linear):
         calls: int
         dual_weight_calls: int
@@ -221,11 +221,13 @@ def test_default_modular_hvp_passes_dual_parameters_to_forward() -> None:
             self.dual_weight_calls = 0
             self.dual_bias_calls = 0
             self.primal_calls = 0
+            self.dual_input_calls = 0
 
         def forward(self, input: torch.Tensor) -> torch.Tensor:
             self.calls += 1
             weight_is_dual = is_dual(self.weight)
             bias_is_dual = is_dual(self.bias)
+            self.dual_input_calls += int(is_dual(input))
             self.dual_weight_calls += int(weight_is_dual)
             self.dual_bias_calls += int(bias_is_dual)
             self.primal_calls += int(not weight_is_dual and not bias_is_dual)
@@ -247,22 +249,39 @@ def test_default_modular_hvp_passes_dual_parameters_to_forward() -> None:
     layer = model[0]
     assert layer.calls == 1
     assert layer.dual_weight_calls == 1
-    assert layer.dual_bias_calls == 1
+    assert layer.dual_bias_calls == 0
+    assert layer.dual_input_calls == 0
     assert layer.primal_calls == 0
     for parameter in model.parameters():
         assert parameter.hvp is not None
 
 
-def test_default_modular_hvp_does_not_replay_suffix_per_parameter(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_default_modular_hvp_does_not_export_dual_activations() -> None:
+    class InspectReLU(nn.ReLU):
+        def __init__(self) -> None:
+            super().__init__()
+            self.dual_input_calls = 0
+
+        def forward(self, input: torch.Tensor) -> torch.Tensor:
+            self.dual_input_calls += int(is_dual(input))
+            return super().forward(input)
+
+    class InspectLinear(nn.Linear):
+        def __init__(self, in_features: int, out_features: int) -> None:
+            super().__init__(in_features, out_features)
+            self.dual_input_calls = 0
+
+        def forward(self, input: torch.Tensor) -> torch.Tensor:
+            self.dual_input_calls += int(is_dual(input))
+            return super().forward(input)
+
     torch.manual_seed(0)
     model = nn.Sequential(
         nn.Linear(3, 5),
-        nn.ReLU(),
-        nn.Linear(5, 4),
-        nn.ReLU(),
-        nn.Linear(4, 2),
+        InspectReLU(),
+        InspectLinear(5, 4),
+        InspectReLU(),
+        InspectLinear(4, 2),
     ).double()
     x = torch.randn(6, 3, dtype=torch.float64)
     target = torch.randn(6, 2, dtype=torch.float64)
@@ -271,26 +290,13 @@ def test_default_modular_hvp_does_not_replay_suffix_per_parameter(
         name: torch.randn_like(parameter)
         for name, parameter in model.named_parameters()
     }
-    counts = {"linear_input_backward": 0}
-    original = local_mlp._linear_input_backward_program
-
-    def counted_linear_input_backward(
-        weight: torch.Tensor,
-        grad_output: torch.Tensor,
-    ) -> torch.Tensor:
-        counts["linear_input_backward"] += 1
-        return original(weight, grad_output)
-
-    monkeypatch.setattr(
-        local_mlp,
-        "_linear_input_backward_program",
-        counted_linear_input_backward,
-    )
 
     with modular_hvp(model, tangents):
         criterion(model(x), target).backward()
 
-    assert counts["linear_input_backward"] == 2
+    for module in model:
+        if isinstance(module, (InspectReLU, InspectLinear)):
+            assert module.dual_input_calls == 0
     for parameter in model.parameters():
         assert parameter.hvp is not None
 

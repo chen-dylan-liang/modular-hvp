@@ -4,6 +4,7 @@ import pytest
 import torch
 from torch import nn
 
+import modular_hvp.dual as dual_backend
 from modular_hvp import (
     is_dual,
     make_dual,
@@ -47,6 +48,10 @@ def test_basic_arithmetic_matches_finite_difference() -> None:
     assert is_dual(output)
     assert torch.allclose(primal(output), fn(a, b))
     assert torch.allclose(tangent(output), fd, rtol=1e-6, atol=1e-6)
+
+
+def test_backend_registers_no_python_level_dual_rules() -> None:
+    assert not hasattr(dual_backend, "_PY_RULES")
 
 
 def test_matmul_matches_finite_difference() -> None:
