@@ -170,6 +170,37 @@ class ForwardRuntimeMixin:
         self._state.next_node_id += 1
         return node_id
 
+    def _share_local_output_tangents_by_block(
+        self,
+        local_output_tangents: dict[nn.Parameter, torch.Tensor],
+    ) -> dict[nn.Parameter, torch.Tensor]:
+        if len(local_output_tangents) <= 1:
+            return local_output_tangents
+
+        result: dict[nn.Parameter, torch.Tensor] = {}
+        handled: set[nn.Parameter] = set()
+        for parameter in local_output_tangents:
+            if parameter in handled:
+                continue
+            group = tuple(
+                group_parameter
+                for group_parameter in self._block_parameters_by_parameter[parameter]
+                if group_parameter in local_output_tangents
+            )
+            handled.update(group)
+            if len(group) == 1:
+                result[parameter] = local_output_tangents[parameter]
+                continue
+
+            combined = local_output_tangents[group[0]]
+            for group_parameter in group[1:]:
+                combined = combined + local_output_tangents[group_parameter]
+            for group_parameter in group:
+                result[group_parameter] = combined.clone(
+                    memory_format=torch.preserve_format
+                )
+        return result
+
     def _install_raw_parameter_graph_sources(self) -> None:
         if not self._use_graph_tensors:
             return
@@ -433,7 +464,9 @@ class ForwardRuntimeMixin:
             rstd=_make_exact_saved_tensor_ref(rstd),
             normalized_shape=normalized_shape,
             eps=eps,
-            local_output_tangents=local_output_tangents,
+            local_output_tangents=self._share_local_output_tangents_by_block(
+                local_output_tangents,
+            ),
         )
 
     def _run_dropout_function_forward(
@@ -508,7 +541,9 @@ class ForwardRuntimeMixin:
             module=module,
             output_node_id=output_node_id,
             indices=indices.detach(),
-            local_output_tangents=local_output_tangents,
+            local_output_tangents=self._share_local_output_tangents_by_block(
+                local_output_tangents,
+            ),
         )
         if output.requires_grad:
             output.register_hook(self._make_forward_record_hook(record))
@@ -566,7 +601,9 @@ class ForwardRuntimeMixin:
                 output,
                 input_primal_live,
             ),
-            local_output_tangents=local_output_tangents,
+            local_output_tangents=self._share_local_output_tangents_by_block(
+                local_output_tangents,
+            ),
         )
         if output.requires_grad:
             output.register_hook(self._make_forward_record_hook(record))
@@ -617,7 +654,9 @@ class ForwardRuntimeMixin:
             input_node_id=input_node_id,
             output_node_id=output_node_id,
             input_activation=_make_conv_input_activation_ref(output, input_primal_live),
-            local_output_tangents=local_output_tangents,
+            local_output_tangents=self._share_local_output_tangents_by_block(
+                local_output_tangents,
+            ),
         )
         if output.requires_grad:
             output.register_hook(self._make_forward_record_hook(record))
@@ -672,7 +711,9 @@ class ForwardRuntimeMixin:
                 output,
                 input_primal_live,
             ),
-            local_output_tangents=local_output_tangents,
+            local_output_tangents=self._share_local_output_tangents_by_block(
+                local_output_tangents,
+            ),
         )
         if output.requires_grad:
             output.register_hook(self._make_forward_record_hook(record))
@@ -724,7 +765,9 @@ class ForwardRuntimeMixin:
             ),
             mean=_make_layer_norm_mean_ref(module, output, input_primal_live),
             rstd=_make_layer_norm_rstd_ref(module, output, input_primal_live),
-            local_output_tangents=local_output_tangents,
+            local_output_tangents=self._share_local_output_tangents_by_block(
+                local_output_tangents,
+            ),
         )
         if output.requires_grad:
             output.register_hook(self._make_forward_record_hook(record))

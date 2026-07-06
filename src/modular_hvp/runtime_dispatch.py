@@ -692,7 +692,9 @@ class GraphDispatchMixin:
                     output.primal,
                     input_primal,
                 ),
-                local_output_tangents=local_output_tangents,
+                local_output_tangents=self._share_local_output_tangents_by_block(
+                    local_output_tangents,
+                ),
             )
         if func in {
             torch.ops.aten.view.default,

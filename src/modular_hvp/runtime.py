@@ -12,6 +12,10 @@ from torch import nn
 from torch.utils.hooks import RemovableHandle
 
 from modular_hvp.backend import DualBackend, LocalDualActivations
+from modular_hvp.model_utils import (
+    _can_use_sequential_fast_path,
+    _is_supported_leaf_module,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +350,136 @@ def _resolve_parameter_blocks(
         raise ValueError(f"tangents were provided for frozen parameters: {frozen_text}")
 
     return tuple(blocks)
+
+
+def _resolve_parameter_block_groups(
+    model: nn.Module,
+    parameter_blocks: Iterable[ParameterBlock],
+    blocks: Mapping[Any, Iterable[str | nn.Parameter]] | None,
+) -> dict[nn.Parameter, tuple[nn.Parameter, ...]]:
+    """Resolve the user block partition into one group tuple per parameter."""
+
+    parameter_blocks_tuple = tuple(parameter_blocks)
+    trainable_parameters = tuple(block.parameter for block in parameter_blocks_tuple)
+    if blocks is None:
+        return {parameter: (parameter,) for parameter in trainable_parameters}
+
+    parameters_by_name = dict(model.named_parameters())
+    parameter_names_by_id = {
+        id(parameter): name for name, parameter in parameters_by_name.items()
+    }
+    trainable_by_id = {id(parameter): parameter for parameter in trainable_parameters}
+
+    block_groups: list[tuple[nn.Parameter, ...]] = []
+    seen_parameter_ids: set[int] = set()
+    for block_key, members in blocks.items():
+        group: list[nn.Parameter] = []
+        seen_in_group: set[int] = set()
+        for member in members:
+            parameter = _resolve_block_member_parameter(
+                member,
+                parameters_by_name=parameters_by_name,
+                parameter_names_by_id=parameter_names_by_id,
+            )
+            parameter_id = id(parameter)
+            if parameter_id not in trainable_by_id:
+                name = parameter_names_by_id[parameter_id]
+                raise ValueError(
+                    f"block {block_key!r} includes frozen parameter {name!r}"
+                )
+            if parameter_id in seen_in_group:
+                name = parameter_names_by_id[parameter_id]
+                raise ValueError(
+                    f"block {block_key!r} includes parameter {name!r} more than once"
+                )
+            if parameter_id in seen_parameter_ids:
+                name = parameter_names_by_id[parameter_id]
+                raise ValueError(
+                    f"parameter {name!r} appears in more than one block"
+                )
+            seen_in_group.add(parameter_id)
+            seen_parameter_ids.add(parameter_id)
+            group.append(parameter)
+        if not group:
+            raise ValueError(f"block {block_key!r} is empty")
+        block_groups.append(tuple(group))
+
+    missing = [
+        parameter_names_by_id[id(parameter)]
+        for parameter in trainable_parameters
+        if id(parameter) not in seen_parameter_ids
+    ]
+    if missing:
+        missing_text = ", ".join(repr(name) for name in missing)
+        raise ValueError(f"custom blocks do not cover trainable parameters: {missing_text}")
+
+    _validate_first_pass_block_groups(model, block_groups, parameter_names_by_id)
+    return {
+        parameter: group
+        for group in block_groups
+        for parameter in group
+    }
+
+
+def _resolve_block_member_parameter(
+    member: str | nn.Parameter,
+    *,
+    parameters_by_name: Mapping[str, nn.Parameter],
+    parameter_names_by_id: Mapping[int, str],
+) -> nn.Parameter:
+    if isinstance(member, str):
+        if member not in parameters_by_name:
+            raise KeyError(f"unknown parameter name in block mapping: {member!r}")
+        return parameters_by_name[member]
+    if isinstance(member, nn.Parameter):
+        if id(member) not in parameter_names_by_id:
+            raise KeyError("block mapping contains a parameter outside the model")
+        return member
+    raise TypeError("block members must be parameter names or torch.nn.Parameter objects")
+
+
+def _validate_first_pass_block_groups(
+    model: nn.Module,
+    block_groups: Iterable[tuple[nn.Parameter, ...]],
+    parameter_names_by_id: Mapping[int, str],
+) -> None:
+    """Validate the first module-wise milestone: one block is one leaf module."""
+
+    grouped_blocks = [group for group in block_groups if len(group) > 1]
+    if not grouped_blocks:
+        return
+    if not (_can_use_sequential_fast_path(model) or _is_supported_leaf_module(model)):
+        raise NotImplementedError(
+            "custom module-wise blocks currently require a supported nn.Sequential "
+            "model or one supported leaf module"
+        )
+
+    direct_owners: dict[nn.Parameter, nn.Module] = {}
+    for module in model.modules():
+        for parameter in module.parameters(recurse=False):
+            direct_owners.setdefault(parameter, module)
+
+    for group in grouped_blocks:
+        owners = {direct_owners.get(parameter) for parameter in group}
+        if None in owners or len(owners) != 1:
+            names = ", ".join(
+                repr(parameter_names_by_id[id(parameter)])
+                for parameter in group
+            )
+            raise NotImplementedError(
+                "module-wise blocks spanning multiple leaf modules are not implemented "
+                f"in the sequential first pass; got block {names}"
+            )
+        owner = next(iter(owners))
+        if not _is_supported_leaf_module(owner):
+            names = ", ".join(
+                repr(parameter_names_by_id[id(parameter)])
+                for parameter in group
+            )
+            raise NotImplementedError(
+                "custom module-wise blocks currently require grouped parameters to "
+                f"belong to one supported leaf module; got block {names}"
+            )
 
 
 def _validate_tangent(

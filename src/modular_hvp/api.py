@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import torch
@@ -17,6 +17,7 @@ def modular_hvp(
     model: nn.Module,
     v: Mapping[str | nn.Parameter, torch.Tensor],
     *,
+    blocks: Mapping[Any, Iterable[str | nn.Parameter]] | None = None,
     backend: DualBackend | None = None,
 ) -> EagerHVPRuntime | ModularHVPRuntime:
     """Create a scoped ModularHVP runtime.
@@ -34,6 +35,9 @@ def modular_hvp(
         Internal extension point for the hook-plumbing runtime. When omitted,
         the eager runtime computes per-parameter HVPs for the currently
         supported eager tensor graph scope.
+    blocks:
+        Optional block partition. Each mapping value lists the parameters that
+        share one local epsilon. When omitted, every parameter is its own block.
     """
 
     if not isinstance(model, nn.Module):
@@ -42,5 +46,9 @@ def modular_hvp(
         raise TypeError("v must be a mapping from parameter names or objects to tensors")
 
     if backend is not None:
+        if blocks is not None:
+            raise NotImplementedError(
+                "custom blocks are currently only supported by the eager runtime"
+            )
         return ModularHVPRuntime(model=model, tangents=v, backend=backend)
-    return EagerHVPRuntime(model=model, tangents=v)
+    return EagerHVPRuntime(model=model, tangents=v, blocks=blocks)

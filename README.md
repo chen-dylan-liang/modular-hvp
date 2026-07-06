@@ -26,6 +26,12 @@ Current implementation status:
   `Conv2d`, eval-mode `BatchNorm2d`, `LayerNorm`, `ReLU`, `GELU`, eval-mode
   `Dropout`, `Flatten`, `AvgPool2d`, `AdaptiveAvgPool2d`, `MaxPool2d`, and
   limited `MultiheadAttention`.
+- The eager runtime also accepts an optional `blocks=` partition for the first
+  module-wise milestone. In this first pass, grouped parameters must belong to
+  one supported leaf module in a sequential model, for example a `Linear`
+  module's `weight` and `bias`. Each grouped block shares one local epsilon, so
+  within-module Hessian cross terms are retained while cross-block terms are
+  still ignored.
 - The primitive `DualTensor` backend implements the operator-overloading layer
   used by lower-level forward-mode tests and by the current local backward
   tensor programs.
@@ -70,17 +76,63 @@ tangent(y_hat)
 This layer overloads selected ATen primitives and raises `NotImplementedError`
 when a `DualTensor` reaches an unsupported operation.
 
+## Custom Blocks
+
+By default, every trainable parameter is its own block:
+
+```python
+with modular_hvp(model, v):
+    loss = criterion(model(x), y)
+    loss.backward()
+```
+
+For the first module-wise milestone, a sequential model can pass an explicit
+partition:
+
+```python
+blocks = {
+    model[0]: ("0.weight", "0.bias"),
+    model[2]: ("2.weight", "2.bias"),
+}
+
+with modular_hvp(model, v, blocks=blocks):
+    loss = criterion(model(x), y)
+    loss.backward()
+```
+
+Every trainable parameter must appear in exactly one block. Parameters in the
+same block share one local epsilon, so for block `B` the public values are:
+
+```text
+p.hvp = sum_{q in B} H[p, q] v_q
+```
+
+The current implementation intentionally rejects custom blocks that span
+multiple leaf modules. Larger contiguous sequential blocks and DAG-aware block
+validation are the next graph-scoping step; the primitive `DualTensor` backend
+does not need to change for that work.
+
 ## Runtime Structure
 
 The default public runtime is now split by responsibility:
 
 - `modular_hvp.dual`: primitive `DualTensor` operator-overloading backend.
+- `modular_hvp.eager`: thin public eager-runtime coordinator.
+- `modular_hvp.runtime_forward`: forward wrapping and local-dual recording.
+- `modular_hvp.runtime_backward`: backward scheduling and HVP accumulation.
+- `modular_hvp.runtime_dispatch`: `GraphTensor` dispatch and forward-record
+  construction.
+- `modular_hvp.graph_tensor`: primal graph-edge wrapper used by the eager
+  recorder.
+- `modular_hvp.runtime_state`: eager runtime state records.
 - `modular_hvp.records`: forward-record dataclasses and saved-tensor
   references.
 - `modular_hvp.graph`: recorded graph topology, use-count analysis, retained
   tangent-node analysis, and reverse traversal readiness state.
-- `modular_hvp.eager`: eager PyTorch integration, module wrapping, loss hook,
-  local tangent injection, and backward-side tensor programs.
+
+Runtime/coordinator files are kept below roughly 2k lines for reviewability.
+`modular_hvp.dual` is the exception: it is the primitive ATen overload backend
+and may grow with operator coverage.
 
 `modular_hvp.local_mlp` remains only as a compatibility shim for older internal
 imports. The default API imports the architecture-agnostic eager runtime.

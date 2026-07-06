@@ -394,6 +394,42 @@ def _block_autodiff_hvps_from_loss(
     return hvps
 
 
+def _custom_block_autodiff_hvps(
+    model: nn.Module,
+    loss_fn: nn.Module,
+    x: torch.Tensor,
+    target: torch.Tensor,
+    tangents: Mapping[str, torch.Tensor],
+    blocks: Mapping[Any, Sequence[str]],
+) -> dict[str, torch.Tensor]:
+    loss = loss_fn(model(x), target)
+    named_parameters = dict(model.named_parameters())
+    hvps: dict[str, torch.Tensor] = {}
+    for block_names in blocks.values():
+        block_parameters = [named_parameters[name] for name in block_names]
+        block_tangents = [tangents[name] for name in block_names]
+        gradients = torch.autograd.grad(
+            loss,
+            block_parameters,
+            create_graph=True,
+            retain_graph=True,
+            materialize_grads=True,
+        )
+        directional_gradient = sum(
+            (gradient * tangent_value).sum()
+            for gradient, tangent_value in zip(gradients, block_tangents, strict=True)
+        )
+        block_hvps = torch.autograd.grad(
+            directional_gradient,
+            block_parameters,
+            retain_graph=True,
+            materialize_grads=True,
+        )
+        for name, hvp in zip(block_names, block_hvps, strict=True):
+            hvps[name] = hvp.detach()
+    return hvps
+
+
 def _finite_difference_block_hvps(
     model: nn.Module,
     loss_fn: nn.Module,
@@ -523,6 +559,92 @@ def test_default_modular_hvp_matches_block_autodiff_on_mlp() -> None:
         assert actual.hvp is not None
     for name, parameter in model.named_parameters():
         assert torch.allclose(parameter.hvp, reference_hvps[name], rtol=1e-10, atol=1e-10)
+
+
+def test_modular_hvp_supports_linear_module_blocks_on_sequential_mlp() -> None:
+    torch.manual_seed(42)
+    baseline = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2)).double()
+    model = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2)).double()
+    model.load_state_dict(baseline.state_dict())
+
+    x = torch.randn(5, 3, dtype=torch.float64)
+    target = torch.randn(5, 2, dtype=torch.float64)
+    criterion = nn.MSELoss()
+    tangents = {
+        name: torch.randn_like(parameter)
+        for name, parameter in model.named_parameters()
+    }
+    blocks = {
+        model[0]: ("0.weight", "0.bias"),
+        model[2]: ("2.weight", "2.bias"),
+    }
+    baseline_blocks = {
+        baseline[0]: ("0.weight", "0.bias"),
+        baseline[2]: ("2.weight", "2.bias"),
+    }
+
+    reference_hvps = _custom_block_autodiff_hvps(
+        baseline,
+        criterion,
+        x,
+        target,
+        tangents,
+        baseline_blocks,
+    )
+    with modular_hvp(model, tangents, blocks=blocks):
+        loss = criterion(model(x), target)
+        loss.backward()
+
+    for name, parameter in model.named_parameters():
+        assert parameter.hvp is not None
+        assert torch.allclose(parameter.hvp, reference_hvps[name], rtol=1e-10, atol=1e-10)
+
+
+def test_linear_module_blocks_keep_within_module_cross_terms() -> None:
+    torch.manual_seed(43)
+    baseline = nn.Sequential(nn.Linear(2, 2), nn.ReLU(), nn.Linear(2, 1)).double()
+    model = nn.Sequential(nn.Linear(2, 2), nn.ReLU(), nn.Linear(2, 1)).double()
+    model.load_state_dict(baseline.state_dict())
+
+    x = torch.randn(4, 2, dtype=torch.float64)
+    target = torch.randn(4, 1, dtype=torch.float64)
+    criterion = nn.MSELoss()
+    tangents = {
+        name: torch.randn_like(parameter)
+        for name, parameter in model.named_parameters()
+    }
+    module_blocks = {
+        model[0]: ("0.weight", "0.bias"),
+        model[2]: ("2.weight", "2.bias"),
+    }
+    baseline_module_blocks = {
+        baseline[0]: ("0.weight", "0.bias"),
+        baseline[2]: ("2.weight", "2.bias"),
+    }
+
+    module_hvps = _custom_block_autodiff_hvps(
+        baseline,
+        criterion,
+        x,
+        target,
+        tangents,
+        baseline_module_blocks,
+    )
+    parameter_hvps = _block_autodiff_hvps(baseline, criterion, x, target, tangents)
+
+    with modular_hvp(model, tangents, blocks=module_blocks):
+        loss = criterion(model(x), target)
+        loss.backward()
+
+    assert not torch.allclose(
+        module_hvps["0.weight"],
+        parameter_hvps["0.weight"],
+        rtol=1e-10,
+        atol=1e-10,
+    )
+    for name, parameter in model.named_parameters():
+        assert parameter.hvp is not None
+        assert torch.allclose(parameter.hvp, module_hvps[name], rtol=1e-10, atol=1e-10)
 
 
 def test_default_modular_hvp_matches_block_autodiff_on_sequential_cnn() -> None:

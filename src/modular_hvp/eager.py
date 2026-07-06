@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import torch
@@ -17,7 +17,7 @@ from modular_hvp.model_utils import (
     _parameter_use_counts,
     _validate_supported_model,
 )
-from modular_hvp.runtime import _resolve_parameter_blocks
+from modular_hvp.runtime import _resolve_parameter_block_groups, _resolve_parameter_blocks
 from modular_hvp.runtime_backward import BackwardRuntimeMixin
 from modular_hvp.runtime_dispatch import GraphDispatchMixin
 from modular_hvp.runtime_forward import ForwardRuntimeMixin
@@ -46,10 +46,16 @@ class EagerHVPRuntime(ForwardRuntimeMixin, GraphDispatchMixin, BackwardRuntimeMi
         *,
         model: nn.Module,
         tangents: Mapping[str | nn.Parameter, torch.Tensor],
+        blocks: Mapping[Any, Iterable[str | nn.Parameter]] | None = None,
     ) -> None:
         _validate_supported_model(model)
         self.model = model
         self.parameter_blocks = _resolve_parameter_blocks(model, tangents)
+        self._block_parameters_by_parameter = _resolve_parameter_block_groups(
+            model,
+            self.parameter_blocks,
+            blocks,
+        )
         self._blocks_by_parameter = {
             block.parameter: block for block in self.parameter_blocks
         }
