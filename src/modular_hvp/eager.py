@@ -18,6 +18,7 @@ from modular_hvp.dual import (
 from modular_hvp.graph import (
     GraphTraversalState,
     RecordedForwardGraph,
+    _local_parameter_use_counts,
     _record_has_backward_nonlinearity_tangents,
     _take_graph_local_parameters_by_output_node,
 )
@@ -320,7 +321,12 @@ class EagerHVPRuntime:
             block.parameter: block.tangent for block in self.parameter_blocks
         }
         self._parameter_use_counts = _parameter_use_counts(model)
-        self._use_graph_tensors = not _can_use_sequential_fast_path(model)
+        self._has_reused_parameters = any(
+            count > 1 for count in self._parameter_use_counts.values()
+        )
+        self._use_graph_tensors = (
+            self._has_reused_parameters or not _can_use_sequential_fast_path(model)
+        )
         self._raw_graph_parameters = (
             _iter_raw_graph_parameters(model) if self._use_graph_tensors else ()
         )
@@ -2145,9 +2151,6 @@ class EagerHVPRuntime:
                 "modular_hvp did not observe a supported scalar loss; "
                 "currently use torch.nn.MSELoss or torch.nn.functional.mse_loss"
             )
-        if any(count > 1 for count in self._parameter_use_counts.values()):
-            self._compute_reused_parameter_hvps_autodiff()
-            return
 
         with torch.no_grad():
             output_curvature = _make_loss_output_curvature(loss_record, grad.detach())
@@ -2159,8 +2162,9 @@ class EagerHVPRuntime:
                 graph = RecordedForwardGraph.from_records(
                     records=self._state.forward_records,
                     output_node_id=self._state.output_node_id,
+                    retain_local_parameter_inputs=self._has_reused_parameters,
                 )
-                if graph.requires_hooked_primal_grads:
+                if graph.requires_hooked_primal_grads or self._has_reused_parameters:
                     self._state.active_graph = graph
                     self._initialize_graph_hvp_hook_state(graph)
                     self._state.loss_record = None
@@ -2202,6 +2206,8 @@ class EagerHVPRuntime:
 
     def _make_forward_record_hook(self, record: ForwardRecord) -> Any:
         self._state.forward_records.append(record)
+        if self._has_reused_parameters:
+            self._state.use_graph_curvature = True
         if isinstance(
             record,
             (
@@ -2314,12 +2320,16 @@ class EagerHVPRuntime:
         for parameter, tangent_value in output_tangents.items():
             output_grad_tangents[parameter] = output_curvature(tangent_value)
         output_tangents.clear()
+        local_parameters_by_output_node = _take_graph_local_parameters_by_output_node(
+            graph.records
+        )
         self._state.graph.prepare_hooked_backward(
             output_node_id=graph.output_node_id,
             output_grad_tangents=output_grad_tangents,
             retained_forward_tangents_by_node=tangents_by_node,
-            local_parameters_by_output_node=(
-                _take_graph_local_parameters_by_output_node(graph.records)
+            local_parameters_by_output_node=local_parameters_by_output_node,
+            remaining_local_uses_by_parameter=_local_parameter_use_counts(
+                local_parameters_by_output_node
             ),
             input_use_counts=graph.fresh_input_use_counts(),
         )
@@ -2407,9 +2417,15 @@ class EagerHVPRuntime:
 
             output_grad_tangents = graph_state.pop_output_grad_tangents(record)
             local_parameters = graph_state.local_parameters_for(record)
-            self._accumulate_graph_record_hvps(record, output_grad_tangents)
+            self._accumulate_graph_record_hvps(
+                record,
+                output_grad_tangents,
+                primal_grad=graph_state.primal_grad(record),
+                forward_tangents_by_node=graph_state.forward_tangents_by_node,
+            )
             for parameter in local_parameters:
-                output_grad_tangents.pop(parameter, None)
+                if graph_state.consume_local_parameter_use(parameter) == 0:
+                    output_grad_tangents.pop(parameter, None)
 
             if output_grad_tangents or _record_has_backward_nonlinearity_tangents(
                 record,
@@ -2421,6 +2437,7 @@ class EagerHVPRuntime:
                     output_grad_tangents,
                     graph_state.forward_tangents_by_node,
                     graph_state.grad_tangents_by_node,
+                    self._tangents_by_parameter,
                 )
 
             graph_state.finish_record(graph, record)
@@ -2528,6 +2545,10 @@ class EagerHVPRuntime:
         self,
         record: ForwardRecord,
         output_grad_tangents: Mapping[nn.Parameter, torch.Tensor],
+        *,
+        primal_grad: torch.Tensor | None = None,
+        forward_tangents_by_node: Mapping[int, Mapping[nn.Parameter, torch.Tensor]]
+        | None = None,
     ) -> None:
         local_parameters = self._graph_record_local_parameters(record)
         local_tangents = _record_local_output_tangents(record)
@@ -2538,15 +2559,29 @@ class EagerHVPRuntime:
                 input_activation = record.input_activation.resolve_and_release().detach()
                 for parameter in local_parameters:
                     grad_tangent = output_grad_tangents.get(parameter)
-                    if grad_tangent is None:
+                    input_tangent = _local_record_input_tangent(
+                        record,
+                        parameter,
+                        forward_tangents_by_node,
+                    )
+                    if parameter is record.module.weight:
                         hvp = torch.zeros_like(parameter)
-                    elif parameter is record.module.weight:
-                        hvp = _linear_weight_backward_program(
-                            input_activation,
-                            grad_tangent,
-                        )
+                        if grad_tangent is not None:
+                            hvp = hvp + _linear_weight_backward_program(
+                                input_activation,
+                                grad_tangent,
+                            )
+                        if input_tangent is not None and primal_grad is not None:
+                            hvp = hvp + _linear_weight_backward_program(
+                                input_tangent,
+                                primal_grad,
+                            )
                     elif parameter is record.module.bias:
-                        hvp = _linear_bias_backward_program(grad_tangent)
+                        hvp = (
+                            torch.zeros_like(parameter)
+                            if grad_tangent is None
+                            else _linear_bias_backward_program(grad_tangent)
+                        )
                     else:
                         raise RuntimeError("local dual activation belongs to wrong module")
                     self._accumulate_hvp(parameter, hvp)
@@ -2572,15 +2607,29 @@ class EagerHVPRuntime:
                 input_activation = record.input_activation.resolve_and_release().detach()
                 for parameter in local_parameters:
                     grad_tangent = output_grad_tangents.get(parameter)
-                    if grad_tangent is None:
+                    input_tangent = _local_record_input_tangent(
+                        record,
+                        parameter,
+                        forward_tangents_by_node,
+                    )
+                    if parameter is record.weight:
                         hvp = torch.zeros_like(parameter)
-                    elif parameter is record.weight:
-                        hvp = _linear_weight_backward_program(
-                            input_activation,
-                            grad_tangent,
-                        )
+                        if grad_tangent is not None:
+                            hvp = hvp + _linear_weight_backward_program(
+                                input_activation,
+                                grad_tangent,
+                            )
+                        if input_tangent is not None and primal_grad is not None:
+                            hvp = hvp + _linear_weight_backward_program(
+                                input_tangent,
+                                primal_grad,
+                            )
                     elif parameter is record.bias:
-                        hvp = _linear_bias_backward_program(grad_tangent)
+                        hvp = (
+                            torch.zeros_like(parameter)
+                            if grad_tangent is None
+                            else _linear_bias_backward_program(grad_tangent)
+                        )
                     else:
                         raise RuntimeError("local dual activation belongs to wrong linear op")
                     self._accumulate_hvp(parameter, hvp)
@@ -2987,29 +3036,6 @@ class EagerHVPRuntime:
             return grad
 
         return loss_hook
-
-    def _compute_reused_parameter_hvps_autodiff(self) -> None:
-        primal_loss = self._state.primal_loss
-        if primal_loss is None:
-            raise RuntimeError("missing saved loss for reused-parameter HVP")
-
-        with torch.enable_grad():
-            for block in self.parameter_blocks:
-                gradient = torch.autograd.grad(
-                    primal_loss,
-                    [block.parameter],
-                    create_graph=True,
-                    retain_graph=True,
-                    materialize_grads=True,
-                )[0]
-                directional_gradient = (gradient * block.tangent).sum()
-                hvp = torch.autograd.grad(
-                    directional_gradient,
-                    [block.parameter],
-                    retain_graph=True,
-                    materialize_grads=True,
-                )[0]
-                setattr(block.parameter, "hvp", hvp.detach())
 
 
 def _graph_runtime_from_tree(value: Any) -> "EagerHVPRuntime | None":
@@ -5103,7 +5129,48 @@ def _propagate_backward_tangent_packet_with_grad(
     output_grad_tangents: Mapping[nn.Parameter, torch.Tensor],
     forward_tangents_by_node: Mapping[int, Mapping[nn.Parameter, torch.Tensor]],
     grad_tangents_by_node: dict[int, dict[nn.Parameter, torch.Tensor]],
+    parameter_tangents: Mapping[nn.Parameter, torch.Tensor],
 ) -> None:
+    if isinstance(record, LinearForwardRecord):
+        weight = record.module.weight.detach()
+        input_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
+        parameters = set(output_grad_tangents)
+        if record.module.weight is not None:
+            parameters.add(record.module.weight)
+        for parameter in parameters:
+            value = None
+            grad_tangent = output_grad_tangents.get(parameter)
+            if grad_tangent is not None:
+                value = _linear_input_backward_program(weight, grad_tangent)
+            if parameter is record.module.weight:
+                weight_tangent = parameter_tangents.get(record.module.weight)
+                if weight_tangent is not None:
+                    term = _linear_input_backward_program(weight_tangent, grad)
+                    value = term if value is None else value + term
+            if value is not None:
+                _accumulate_parameter_tensor(input_packet, parameter, value)
+        return
+
+    if isinstance(record, FunctionalLinearForwardRecord):
+        weight = record.weight.detach()
+        input_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
+        parameters = set(output_grad_tangents)
+        if isinstance(record.weight, nn.Parameter):
+            parameters.add(record.weight)
+        for parameter in parameters:
+            value = None
+            grad_tangent = output_grad_tangents.get(parameter)
+            if grad_tangent is not None:
+                value = _linear_input_backward_program(weight, grad_tangent)
+            if parameter is record.weight and isinstance(record.weight, nn.Parameter):
+                weight_tangent = parameter_tangents.get(record.weight)
+                if weight_tangent is not None:
+                    term = _linear_input_backward_program(weight_tangent, grad)
+                    value = term if value is None else value + term
+            if value is not None:
+                _accumulate_parameter_tensor(input_packet, parameter, value)
+        return
+
     if isinstance(record, MatmulForwardRecord):
         left = record.left_activation.resolve().detach()
         right = record.right_activation.resolve().detach()
@@ -5432,6 +5499,20 @@ def _accumulate_parameter_tensor(
         values_by_parameter[parameter] = value
     else:
         values_by_parameter[parameter] = existing + value
+
+
+def _local_record_input_tangent(
+    record: ForwardRecord,
+    parameter: nn.Parameter,
+    forward_tangents_by_node: Mapping[int, Mapping[nn.Parameter, torch.Tensor]]
+    | None,
+) -> torch.Tensor | None:
+    if forward_tangents_by_node is None:
+        return None
+    input_node_ids = _record_input_node_ids(record)
+    if len(input_node_ids) != 1:
+        return None
+    return forward_tangents_by_node.get(input_node_ids[0], {}).get(parameter)
 
 
 def _empty_from_saved_ref(

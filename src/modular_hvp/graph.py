@@ -43,6 +43,7 @@ class RecordedForwardGraph:
         *,
         records: Sequence[ForwardRecord],
         output_node_id: int,
+        retain_local_parameter_inputs: bool = False,
     ) -> "RecordedForwardGraph":
         records_tuple = tuple(records)
         return cls(
@@ -57,6 +58,7 @@ class RecordedForwardGraph:
                 _graph_forward_tangent_retained_node_ids(
                     records_tuple,
                     output_node_id,
+                    retain_local_parameter_inputs=retain_local_parameter_inputs,
                 )
             ),
             requires_hooked_primal_grads=_graph_requires_primal_backward_grad(
@@ -88,6 +90,9 @@ class GraphTraversalState:
         int,
         tuple[nn.Parameter, ...],
     ] = field(default_factory=dict)
+    remaining_local_uses_by_parameter: dict[nn.Parameter, int] = field(
+        default_factory=dict
+    )
 
     def clear(self) -> None:
         self.forward_tangents_by_node.clear()
@@ -97,6 +102,7 @@ class GraphTraversalState:
         self.processed_output_node_ids.clear()
         self.ready_output_node_ids.clear()
         self.local_parameters_by_output_node.clear()
+        self.remaining_local_uses_by_parameter.clear()
 
     def prepare_hooked_backward(
         self,
@@ -108,12 +114,14 @@ class GraphTraversalState:
             dict[nn.Parameter, torch.Tensor],
         ],
         local_parameters_by_output_node: dict[int, tuple[nn.Parameter, ...]],
+        remaining_local_uses_by_parameter: dict[nn.Parameter, int],
         input_use_counts: dict[int, int],
     ) -> None:
         self.clear()
         self.forward_tangents_by_node = retained_forward_tangents_by_node
         self.grad_tangents_by_node = {output_node_id: output_grad_tangents}
         self.local_parameters_by_output_node = local_parameters_by_output_node
+        self.remaining_local_uses_by_parameter = remaining_local_uses_by_parameter
         self.pending_consumers_by_node = input_use_counts
 
     def observe_primal_grad(
@@ -161,6 +169,15 @@ class GraphTraversalState:
             return stored
         return tuple(_record_local_output_tangents(record))
 
+    def consume_local_parameter_use(self, parameter: nn.Parameter) -> int:
+        remaining = self.remaining_local_uses_by_parameter.get(parameter, 0)
+        if remaining <= 1:
+            self.remaining_local_uses_by_parameter.pop(parameter, None)
+            return 0
+        remaining -= 1
+        self.remaining_local_uses_by_parameter[parameter] = remaining
+        return remaining
+
     def finish_record(
         self,
         graph: RecordedForwardGraph,
@@ -206,6 +223,16 @@ def _take_graph_local_parameters_by_output_node(
     return local_parameters_by_node
 
 
+def _local_parameter_use_counts(
+    local_parameters_by_output_node: Mapping[int, tuple[nn.Parameter, ...]],
+) -> dict[nn.Parameter, int]:
+    counts: dict[nn.Parameter, int] = {}
+    for parameters in local_parameters_by_output_node.values():
+        for parameter in parameters:
+            counts[parameter] = counts.get(parameter, 0) + 1
+    return counts
+
+
 def _graph_input_use_counts(records: Sequence[ForwardRecord]) -> dict[int, int]:
     counts: dict[int, int] = {}
     for record in records:
@@ -217,9 +244,13 @@ def _graph_input_use_counts(records: Sequence[ForwardRecord]) -> dict[int, int]:
 def _graph_forward_tangent_retained_node_ids(
     records: Sequence[ForwardRecord],
     output_node_id: int,
+    *,
+    retain_local_parameter_inputs: bool,
 ) -> set[int]:
     retained = {output_node_id}
     for record in records:
+        if retain_local_parameter_inputs and _record_local_output_tangents(record):
+            retained.update(_record_input_node_ids(record))
         if isinstance(record, (GELUForwardRecord, LayerNormForwardRecord, RMSNormForwardRecord)):
             retained.add(record.input_node_id)
         elif isinstance(record, SoftmaxForwardRecord):

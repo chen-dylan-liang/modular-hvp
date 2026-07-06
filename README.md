@@ -160,8 +160,9 @@ backward pass, and one `param.hmp(...)` application per parameter.
 The current `modular_hvp` implementation follows the block-scoped forward
 locality invariant: parameter tangents are consumed inside the owning module,
 the local dual activation is saved, and only the primal output is passed to the
-rest of the model. Reused parameters accumulate into the same `p.hvp`; the
-current shared-parameter path uses a correctness fallback.
+rest of the model. Reused and tied parameters use the graph path: each local
+use-site contributes to the same public `p.hvp`, without model replay or a
+reverse-over-reverse fallback.
 
 The eager runtime does not compute a full HVP and slice it. It also no longer
 uses keyed `DualTensor` payloads to carry multiple epsilons through the forward
@@ -205,7 +206,7 @@ For Linear activation values needed by the local backward-side tensor programs,
 the runtime resolves tensors already saved by PyTorch autograd and releases the
 autograd-node reference inside the hook. For Conv2d/BatchNorm2d local
 parameter-gradient formulas and ReLU masks in residual/DAG graphs, the runtime
-keeps a detached direct fallback to avoid ambiguous same-shaped saved tensors
+keeps a detached direct reference to avoid ambiguous same-shaped saved tensors
 and freed autograd internals. Saved local output tangents are cleared
 immediately after their owning backward hook consumes them.
 
@@ -446,10 +447,13 @@ Current limitations:
   view/reshape, transpose/contiguous, matmul, scalar division, softmax,
   scaled-dot-product attention, and the constrained `MultiheadAttention` path
   listed above.
-- Training-mode dropout, masks in attention, cross-attention, unpacked
-  `MultiheadAttention` projection weights, and shared-parameter models remain
-  outside the optimized public runtime path.
-- Shared-parameter models still use the existing correctness fallback.
+- Training-mode dropout, masks in attention, cross-attention, and unpacked
+  `MultiheadAttention` projection weights remain outside the optimized public
+  runtime path.
+- Shared and tied parameters are supported when each use site is covered by the
+  existing primitive/local graph records. The regression suite covers a tied
+  `nn.Embedding`/linear LM head while forcing `torch.autograd.grad` to fail
+  inside `modular_hvp`, which guards against reintroducing the old fallback.
 
 ## Primitive Coverage Roadmap
 

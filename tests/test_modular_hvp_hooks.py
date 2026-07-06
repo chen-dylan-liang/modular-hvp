@@ -170,6 +170,19 @@ class TinyNanoChatPattern(nn.Module):
         )
 
 
+class TinyTiedEmbeddingLM(nn.Module):
+    def __init__(self, vocab_size: int = 13, d_model: int = 5) -> None:
+        super().__init__()
+        self.wte = nn.Embedding(vocab_size, d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.wte.weight
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        hidden = torch.tanh(self.wte(idx))
+        logits = self.lm_head(hidden)
+        return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+
 def _tangents_by_name(model: nn.Module) -> dict[str, torch.Tensor]:
     return {
         name: torch.ones_like(parameter)
@@ -775,7 +788,9 @@ def test_default_modular_hvp_does_not_export_dual_activations() -> None:
         assert parameter.hvp is not None
 
 
-def test_default_modular_hvp_accumulates_reused_parameter_hvps() -> None:
+def test_default_modular_hvp_accumulates_reused_parameter_hvps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     torch.manual_seed(1)
 
     def make_model() -> nn.Sequential:
@@ -795,11 +810,53 @@ def test_default_modular_hvp_accumulates_reused_parameter_hvps() -> None:
     }
     reference_hvps = _block_autodiff_hvps(baseline, criterion, x, target, tangents)
 
+    def fail_autograd_grad(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("modular_hvp must not use reverse-over-reverse fallback")
+
+    monkeypatch.setattr(torch.autograd, "grad", fail_autograd_grad)
     with modular_hvp(model, tangents):
         criterion(model(x), target).backward()
 
     for name, parameter in model.named_parameters():
         assert torch.allclose(parameter.hvp, reference_hvps[name], rtol=1e-10, atol=1e-10)
+
+
+def test_default_modular_hvp_supports_tied_embedding_lm_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(29)
+    baseline = TinyTiedEmbeddingLM().double()
+    model = TinyTiedEmbeddingLM().double()
+    model.load_state_dict(baseline.state_dict())
+
+    idx = torch.randint(0, 13, (3, 4), dtype=torch.long)
+    targets = torch.randint(0, 13, (3, 4), dtype=torch.long)
+    tangents = {
+        name: torch.randn_like(parameter)
+        for name, parameter in model.named_parameters()
+    }
+    assert set(tangents) == {"wte.weight"}
+
+    reference_hvps = _block_autodiff_hvps_from_loss(
+        baseline(idx, targets),
+        baseline,
+        tangents,
+    )
+
+    def fail_autograd_grad(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("modular_hvp must not use reverse-over-reverse fallback")
+
+    monkeypatch.setattr(torch.autograd, "grad", fail_autograd_grad)
+    with modular_hvp(model, tangents):
+        model(idx, targets).backward()
+
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(
+            parameter.hvp,
+            reference_hvps[name],
+            rtol=1e-10,
+            atol=1e-10,
+        )
 
 
 def test_explicit_hook_backend_preserves_primal_forward_and_gradients() -> None:
