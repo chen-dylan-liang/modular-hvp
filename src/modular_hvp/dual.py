@@ -376,6 +376,40 @@ def _make_rule_output(
     return make_dual(primal_output, tangent_output)
 
 
+def _make_rule_tree(primal_output: Any, tangent_output: Any) -> Any:
+    if isinstance(primal_output, torch.Tensor):
+        return _make_rule_output(primal_output, tangent_output)
+    if isinstance(primal_output, tuple):
+        return tuple(
+            _make_rule_tree(primal_item, tangent_item)
+            for primal_item, tangent_item in zip(
+                primal_output,
+                tangent_output,
+                strict=True,
+            )
+        )
+    if isinstance(primal_output, list):
+        return [
+            _make_rule_tree(primal_item, tangent_item)
+            for primal_item, tangent_item in zip(
+                primal_output,
+                tangent_output,
+                strict=True,
+            )
+        ]
+    return primal_output
+
+
+def _zero_like_tree(primal_output: Any) -> Any:
+    if isinstance(primal_output, torch.Tensor):
+        return torch.zeros_like(primal_output.detach())
+    if isinstance(primal_output, tuple):
+        return tuple(_zero_like_tree(item) for item in primal_output)
+    if isinstance(primal_output, list):
+        return [_zero_like_tree(item) for item in primal_output]
+    return primal_output
+
+
 def _make_zero_rule_output(tangent_output: torch.Tensor) -> DualTensor:
     return _make_zero_dual(tangent_output)
 
@@ -427,6 +461,26 @@ def _apply_same_unary_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, A
             )
         )
     return _wrap(primal_output, tangent_output)
+
+
+def _apply_same_tree_unary_rule(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> Any:
+    value = args[0]
+    value_p, value_t, _ = _split(value)
+    other_args = args[1:]
+    primal_args = (value_p, *_tree_primal(other_args))
+    primal_kwargs = _tree_primal(kwargs)
+    primal_output = _call_primal(func, *primal_args, **primal_kwargs)
+    with torch.no_grad():
+        tangent_output = (
+            _zero_like_tree(primal_output)
+            if value_t is None
+            else func(value_t, *_tree_detach(other_args), **primal_kwargs)
+        )
+    return _make_rule_tree(primal_output, tangent_output)
 
 
 def _add_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
@@ -1122,6 +1176,263 @@ def _gelu_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Dual
     return _make_rule_output(primal_output, tangent_output)
 
 
+def _gelu_backward_rule(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> DualTensor:
+    grad_output, input_value = args[:2]
+    approximate = args[2] if len(args) > 2 else kwargs.get("approximate", "none")
+    grad_p, grad_t, grad_is_dual = _split(grad_output)
+    input_p, input_t, input_is_dual = _split(input_value)
+    primal_output = _call_primal(func, grad_p, input_p, approximate, **kwargs)
+
+    with torch.no_grad():
+        input_ng = input_p.detach()
+        grad_ng = grad_p.detach()
+        if approximate == "tanh":
+            raise NotImplementedError(
+                "GELU tanh backward dual rule not implemented yet"
+            )
+        normal_cdf = 0.5 * (1 + torch.erf(input_ng / math.sqrt(2.0)))
+        normal_pdf = torch.exp(-0.5 * input_ng.pow(2)) / math.sqrt(2.0 * math.pi)
+        gelu_prime = normal_cdf + input_ng * normal_pdf
+        gelu_second = (2.0 - input_ng.pow(2)) * normal_pdf
+        tangent_output = _add_terms(
+            _map_tangent(lambda item: item * gelu_prime, grad_t)
+            if grad_is_dual
+            else None,
+            _map_tangent(lambda item: grad_ng * gelu_second * item, input_t)
+            if input_is_dual
+            else None,
+        )
+        if tangent_output is None:
+            tangent_output = torch.zeros_like(primal_output.detach())
+    return _make_rule_output(primal_output, tangent_output)
+
+
+def _softmax_rule(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> DualTensor:
+    value = args[0]
+    dim = args[1] if len(args) > 1 else kwargs["dim"]
+    value_p, value_t, _ = _split(value)
+    primal_output = _call_primal(func, value_p, *args[1:], **kwargs)
+    with torch.no_grad():
+        if value_t is None:
+            tangent_output = torch.zeros_like(primal_output.detach())
+        else:
+            output_ng = primal_output.detach()
+            weighted = (output_ng * value_t).sum(dim=dim, keepdim=True)
+            tangent_output = output_ng * (value_t - weighted)
+    return _make_rule_output(primal_output, tangent_output)
+
+
+def _softmax_backward_rule(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> DualTensor:
+    grad_output, output, dim = args[:3]
+    input_dtype = args[3] if len(args) > 3 else kwargs.get("input_dtype")
+    grad_p, grad_t, grad_is_dual = _split(grad_output)
+    output_p, output_t, output_is_dual = _split(output)
+    if len(args) > 3:
+        primal_output = _call_primal(func, grad_p, output_p, dim, input_dtype, **kwargs)
+    else:
+        primal_output = _call_primal(func, grad_p, output_p, dim, **kwargs)
+
+    with torch.no_grad():
+        grad_ng = grad_p.detach()
+        output_ng = output_p.detach()
+        centered_grad = grad_ng - (grad_ng * output_ng).sum(dim=dim, keepdim=True)
+        tangent_output = _add_terms(
+            _map_tangent(
+                lambda item: output_ng
+                * (item - (item * output_ng).sum(dim=dim, keepdim=True)),
+                grad_t,
+            )
+            if grad_is_dual
+            else None,
+            _map_tangent(
+                lambda item: item * centered_grad
+                - output_ng
+                * (grad_ng * item).sum(dim=dim, keepdim=True),
+                output_t,
+            )
+            if output_is_dual
+            else None,
+        )
+        if tangent_output is None:
+            tangent_output = torch.zeros_like(primal_output.detach())
+    return _make_rule_output(primal_output, tangent_output)
+
+
+def _scaled_dot_product_attention_rule(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> DualTensor:
+    query, key, value = args[:3]
+    attn_mask = args[3] if len(args) > 3 else kwargs.get("attn_mask")
+    dropout_p = args[4] if len(args) > 4 else kwargs.get("dropout_p", 0.0)
+    is_causal = args[5] if len(args) > 5 else kwargs.get("is_causal", False)
+    scale = kwargs.get("scale")
+    if dropout_p != 0.0:
+        raise NotImplementedError(
+            "DualTensor rule for scaled_dot_product_attention currently requires dropout_p=0"
+        )
+    if is_dual(attn_mask):
+        raise NotImplementedError(
+            "DualTensor rule not implemented for dual attention masks"
+        )
+
+    query_p, query_t, query_is_dual = _split(query)
+    key_p, key_t, key_is_dual = _split(key)
+    value_p, value_t, value_is_dual = _split(value)
+    primal_output = _call_primal(func, *_tree_primal(args), **_tree_primal(kwargs))
+
+    with torch.no_grad():
+        attention, score_tangent = _attention_and_score_tangent(
+            query_p,
+            query_t if query_is_dual else None,
+            key_p,
+            key_t if key_is_dual else None,
+            attn_mask,
+            is_causal,
+            scale,
+        )
+        tangent_output = _add_terms(
+            torch.matmul(
+                _softmax_jvp_from_output(attention, score_tangent, -1),
+                value_p.detach(),
+            )
+            if score_tangent is not None
+            else None,
+            torch.matmul(attention, value_t) if value_is_dual else None,
+        )
+        if tangent_output is None:
+            tangent_output = torch.zeros_like(primal_output.detach())
+    return _make_rule_output(primal_output, tangent_output)
+
+
+def _scaled_dot_product_flash_attention_rule(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[Any, ...]:
+    query, key, value = args[:3]
+    dropout_p = args[3] if len(args) > 3 else kwargs.get("dropout_p", 0.0)
+    is_causal = args[4] if len(args) > 4 else kwargs.get("is_causal", False)
+    scale = kwargs.get("scale")
+    if dropout_p != 0.0:
+        raise NotImplementedError(
+            "DualTensor rule for flash attention currently requires dropout_p=0"
+        )
+
+    query_p, query_t, query_is_dual = _split(query)
+    key_p, key_t, key_is_dual = _split(key)
+    value_p, value_t, value_is_dual = _split(value)
+    primal_outputs = _call_primal(func, *_tree_primal(args), **_tree_primal(kwargs))
+    primal_output = primal_outputs[0]
+
+    with torch.no_grad():
+        attention, score_tangent = _attention_and_score_tangent(
+            query_p,
+            query_t if query_is_dual else None,
+            key_p,
+            key_t if key_is_dual else None,
+            None,
+            is_causal,
+            scale,
+        )
+        tangent_output = _add_terms(
+            torch.matmul(
+                _softmax_jvp_from_output(attention, score_tangent, -1),
+                value_p.detach(),
+            )
+            if score_tangent is not None
+            else None,
+            torch.matmul(attention, value_t) if value_is_dual else None,
+        )
+        if tangent_output is None:
+            tangent_output = torch.zeros_like(primal_output.detach())
+    return (_make_rule_output(primal_output, tangent_output), *primal_outputs[1:])
+
+
+def _native_layer_norm_rule(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[DualTensor, DualTensor, DualTensor]:
+    input_value, normalized_shape, weight, bias, eps = args[:5]
+    input_p, input_t, input_is_dual = _split(input_value)
+    weight_p, weight_t, weight_is_dual = _split(weight)
+    bias_p, bias_t, bias_is_dual = _split(bias)
+    primal_output, mean, rstd = _call_primal(
+        func,
+        input_p,
+        normalized_shape,
+        weight_p,
+        bias_p,
+        eps,
+        **kwargs,
+    )
+
+    with torch.no_grad():
+        input_ng = input_p.detach()
+        normalized_ndim = len(tuple(normalized_shape))
+        dims = tuple(range(input_ng.dim() - normalized_ndim, input_ng.dim()))
+        mean_ng = mean.detach()
+        rstd_ng = rstd.detach()
+        centered = input_ng - mean_ng
+        normalized = centered * rstd_ng
+        if input_is_dual:
+            mean_tangent = input_t.mean(dim=dims, keepdim=True)
+            centered_tangent = input_t - mean_tangent
+            var_tangent = (2.0 * centered * centered_tangent).mean(
+                dim=dims,
+                keepdim=True,
+            )
+            rstd_tangent = -0.5 * rstd_ng.pow(3) * var_tangent
+            normalized_tangent = centered_tangent * rstd_ng + centered * rstd_tangent
+        else:
+            mean_tangent = torch.zeros_like(mean_ng)
+            rstd_tangent = torch.zeros_like(rstd_ng)
+            normalized_tangent = torch.zeros_like(input_ng)
+
+        tangent_output = normalized_tangent
+        if weight_p is not None:
+            tangent_output = tangent_output * weight_p.detach()
+        if weight_is_dual:
+            tangent_output = tangent_output + normalized * weight_t
+        if bias_is_dual:
+            tangent_output = tangent_output + bias_t
+
+    return (
+        _make_rule_output(primal_output, tangent_output),
+        _make_rule_output(mean, mean_tangent),
+        _make_rule_output(rstd, rstd_tangent),
+    )
+
+
+def _embedding_rule(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> DualTensor:
+    weight, indices = args[:2]
+    weight_p, weight_t, weight_is_dual = _split(weight)
+    if is_dual(indices):
+        raise NotImplementedError("DualTensor rule not implemented for dual indices")
+    primal_output = _call_primal(func, weight_p, indices, *args[2:], **kwargs)
+    with torch.no_grad():
+        tangent_output = (
+            func(weight_t, indices, *_tree_detach(args[2:]), **_tree_detach(kwargs))
+            if weight_is_dual
+            else torch.zeros_like(primal_output.detach())
+        )
+    return _make_rule_output(primal_output, tangent_output)
+
+
 def _threshold_backward_rule(
     func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> DualTensor:
@@ -1271,6 +1582,56 @@ def _where_tangent(func: Any, condition: Any, left: Any, right: Any) -> Any:
     return func(condition, left, right)
 
 
+def _attention_and_score_tangent(
+    query: torch.Tensor,
+    query_tangent: torch.Tensor | None,
+    key: torch.Tensor,
+    key_tangent: torch.Tensor | None,
+    attn_mask: Any,
+    is_causal: bool,
+    scale: float | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    query_ng = query.detach()
+    key_ng = key.detach()
+    scale_factor = (1.0 / math.sqrt(query_ng.size(-1))) if scale is None else scale
+    scores = torch.matmul(query_ng, key_ng.transpose(-2, -1)) * scale_factor
+    if is_causal:
+        query_len = query_ng.size(-2)
+        key_len = key_ng.size(-2)
+        causal_mask = torch.ones(
+            query_len,
+            key_len,
+            dtype=torch.bool,
+            device=query_ng.device,
+        ).tril()
+        scores = scores.masked_fill(~causal_mask, float("-inf"))
+    if attn_mask is not None:
+        mask = primal(attn_mask)
+        if mask.dtype == torch.bool:
+            scores = scores.masked_fill(~mask, float("-inf"))
+        else:
+            scores = scores + mask.detach()
+    attention = torch.softmax(scores, dim=-1)
+    score_tangent = _add_terms(
+        torch.matmul(query_tangent, key_ng.transpose(-2, -1)) * scale_factor
+        if query_tangent is not None
+        else None,
+        torch.matmul(query_ng, key_tangent.transpose(-2, -1)) * scale_factor
+        if key_tangent is not None
+        else None,
+    )
+    return attention, score_tangent
+
+
+def _softmax_jvp_from_output(
+    softmax_output: torch.Tensor,
+    input_tangent: torch.Tensor,
+    dim: int,
+) -> torch.Tensor:
+    weighted = (softmax_output * input_tangent).sum(dim=dim, keepdim=True)
+    return softmax_output * (input_tangent - weighted)
+
+
 def _register(name: str, overload: str, rule: Rule) -> None:
     packet = getattr(torch.ops.aten, name, None)
     if packet is None or overload not in packet.overloads():
@@ -1281,6 +1642,8 @@ def _register(name: str, overload: str, rule: Rule) -> None:
 for _name, _overload in (
     ("add", "Tensor"),
     ("add", "Scalar"),
+    ("add_", "Tensor"),
+    ("add_", "Scalar"),
 ):
     _register(_name, _overload, _add_rule)
 
@@ -1347,10 +1710,30 @@ for _name, _overload in (
 ):
     _register(_name, _overload, _apply_same_unary_rule)
 
+for _name, _overload in (
+    ("split", "Tensor"),
+    ("split", "sizes"),
+    ("split_with_sizes", "default"),
+    ("slice", "Tensor"),
+    ("select", "int"),
+):
+    _register(_name, _overload, _apply_same_tree_unary_rule)
+
 _register("max_pool2d_with_indices", "default", _max_pool2d_with_indices_rule)
 _register("relu", "default", _relu_rule)
 _register("threshold_backward", "default", _threshold_backward_rule)
 _register("gelu", "default", _gelu_rule)
+_register("gelu_backward", "default", _gelu_backward_rule)
+_register("_softmax", "default", _softmax_rule)
+_register("_softmax_backward_data", "default", _softmax_backward_rule)
+_register("scaled_dot_product_attention", "default", _scaled_dot_product_attention_rule)
+_register(
+    "_scaled_dot_product_flash_attention",
+    "default",
+    _scaled_dot_product_flash_attention_rule,
+)
+_register("native_layer_norm", "default", _native_layer_norm_rule)
+_register("embedding", "default", _embedding_rule)
 _register("mse_loss", "default", _mse_loss_rule)
 _register("mse_loss_backward", "default", _mse_loss_backward_rule)
 

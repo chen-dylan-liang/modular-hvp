@@ -276,6 +276,74 @@ def test_max_pool2d_dual_uses_primal_argmax_locations() -> None:
     _assert_graph_free(tangent(output))
 
 
+def test_softmax_matches_finite_difference() -> None:
+    torch.manual_seed(16)
+    x = torch.randn(2, 3, 4, dtype=torch.float64)
+    x_dot = torch.randn_like(x)
+
+    def fn(x_value: torch.Tensor) -> torch.Tensor:
+        return torch.softmax(x_value, dim=-1)
+
+    output = fn(make_dual(x, x_dot))
+    fd = _central_difference(fn, (x,), (x_dot,))
+
+    assert torch.allclose(primal(output), fn(x))
+    assert torch.allclose(tangent(output), fd, rtol=1e-6, atol=1e-6)
+    _assert_graph_free(tangent(output))
+
+
+def test_scaled_dot_product_attention_matches_finite_difference() -> None:
+    torch.manual_seed(19)
+    q = torch.randn(2, 2, 4, 4, dtype=torch.float64)
+    k = torch.randn(2, 2, 4, 4, dtype=torch.float64)
+    v = torch.randn(2, 2, 4, 4, dtype=torch.float64)
+    q_dot = torch.randn_like(q)
+    k_dot = torch.randn_like(k)
+    v_dot = torch.randn_like(v)
+
+    def fn(
+        q_value: torch.Tensor,
+        k_value: torch.Tensor,
+        v_value: torch.Tensor,
+    ) -> torch.Tensor:
+        return F.scaled_dot_product_attention(
+            q_value,
+            k_value,
+            v_value,
+            dropout_p=0.0,
+        )
+
+    output = fn(make_dual(q, q_dot), make_dual(k, k_dot), make_dual(v, v_dot))
+    fd = _central_difference(fn, (q, k, v), (q_dot, k_dot, v_dot))
+
+    assert torch.allclose(primal(output), fn(q, k, v))
+    assert torch.allclose(tangent(output), fd, rtol=1e-6, atol=1e-6)
+    _assert_graph_free(tangent(output))
+
+
+def test_layer_norm_dual_matches_finite_difference() -> None:
+    torch.manual_seed(17)
+    layer = nn.LayerNorm(5).double()
+    x = torch.randn(2, 3, 5, dtype=torch.float64)
+    weight_dot = torch.randn_like(layer.weight)
+
+    base = layer(x)
+    output = run_with_dual_parameter(layer, "weight", weight_dot, x)
+
+    h = 1e-6
+    with torch.no_grad():
+        layer.weight.add_(h * weight_dot)
+        plus = layer(x)
+        layer.weight.add_(-2 * h * weight_dot)
+        minus = layer(x)
+        layer.weight.add_(h * weight_dot)
+    fd = (plus - minus) / (2 * h)
+
+    assert torch.allclose(primal(output), base)
+    assert torch.allclose(tangent(output), fd, rtol=1e-6, atol=1e-6)
+    _assert_graph_free(tangent(output))
+
+
 def test_toy_mlp_single_dual_parameter_matches_finite_difference() -> None:
     torch.manual_seed(4)
     model = nn.Sequential(
@@ -381,6 +449,61 @@ def test_resnet_like_forward_dual_composes_through_residual_add() -> None:
         model.conv2.weight.add_(-2 * h * weight_dot)
         minus = model(x)
         model.conv2.weight.add_(h * weight_dot)
+    fd = (plus - minus) / (2 * h)
+
+    assert torch.allclose(primal(output), base)
+    assert torch.allclose(tangent(output), fd, rtol=1e-5, atol=1e-6)
+    _assert_graph_free(tangent(output))
+
+
+def test_transformer_block_forward_dual_composes_through_attention_primitives() -> None:
+    class TinyTransformerBlock(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.n_heads = 2
+            self.d_head = 4
+            self.qkv = nn.Linear(8, 24)
+            self.proj = nn.Linear(8, 8)
+            self.ln1 = nn.LayerNorm(8)
+            self.ln2 = nn.LayerNorm(8)
+            self.ff1 = nn.Linear(8, 32)
+            self.gelu = nn.GELU()
+            self.ff2 = nn.Linear(32, 8)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            h = self.ln1(x)
+            qkv = self.qkv(h)
+            q, k, v = qkv.chunk(3, dim=-1)
+            batch, tokens, channels3 = qkv.shape
+            channels = channels3 // 3
+            q = q.view(batch, tokens, self.n_heads, self.d_head).transpose(1, 2)
+            k = k.view(batch, tokens, self.n_heads, self.d_head).transpose(1, 2)
+            v = v.view(batch, tokens, self.n_heads, self.d_head).transpose(1, 2)
+            scores = (q @ k.transpose(-2, -1)) / (self.d_head**0.5)
+            attention = torch.softmax(scores, dim=-1)
+            y = (attention @ v).transpose(1, 2).contiguous().view(
+                batch,
+                tokens,
+                channels,
+            )
+            x = x + self.proj(y)
+            return x + self.ff2(self.gelu(self.ff1(self.ln2(x))))
+
+    torch.manual_seed(18)
+    model = TinyTransformerBlock().double().eval()
+    x = torch.randn(2, 4, 8, dtype=torch.float64)
+    weight_dot = torch.randn_like(model.qkv.weight)
+
+    base = model(x)
+    output = run_with_dual_parameter(model, "qkv.weight", weight_dot, x)
+
+    h = 1e-6
+    with torch.no_grad():
+        model.qkv.weight.add_(h * weight_dot)
+        plus = model(x)
+        model.qkv.weight.add_(-2 * h * weight_dot)
+        minus = model(x)
+        model.qkv.weight.add_(h * weight_dot)
     fd = (plus - minus) / (2 * h)
 
     assert torch.allclose(primal(output), base)

@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from modular_hvp.backend import DualBackend, FakeDualBackend
-from modular_hvp.local_mlp import LocalMLPHVPRuntime
+from modular_hvp.eager import EagerHVPRuntime
 from modular_hvp.runtime import ModularHVPRuntime
 
 
@@ -18,7 +18,7 @@ def modular_hvp(
     v: Mapping[str | nn.Parameter, torch.Tensor],
     *,
     backend: DualBackend | None = None,
-) -> ModularHVPRuntime:
+) -> EagerHVPRuntime | ModularHVPRuntime:
     """Create a scoped ModularHVP runtime.
 
     Parameters
@@ -32,8 +32,8 @@ def modular_hvp(
         parameter.
     backend:
         Internal extension point for the hook-plumbing runtime. When omitted,
-        the local MLP runtime computes per-parameter HVPs for the currently
-        supported Linear/ReLU/MSE scope.
+        the eager runtime computes per-parameter HVPs for the currently
+        supported eager tensor graph scope.
     """
 
     if not isinstance(model, nn.Module):
@@ -43,4 +43,4 @@ def modular_hvp(
 
     if backend is not None:
         return ModularHVPRuntime(model=model, tangents=v, backend=backend)
-    return LocalMLPHVPRuntime(model=model, tangents=v)
+    return EagerHVPRuntime(model=model, tangents=v)
