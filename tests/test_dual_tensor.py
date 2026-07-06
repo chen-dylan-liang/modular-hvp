@@ -130,6 +130,39 @@ def test_relu_primal_keeps_graph_and_tangent_is_graph_free() -> None:
     torch.testing.assert_close(tangent(y_hat), fd, rtol=1e-2, atol=1e-3)
 
 
+def test_masked_fill_dual_matches_where_rule() -> None:
+    torch.manual_seed(31)
+    x = torch.randn(3, 4, dtype=torch.float64)
+    x_dot = torch.randn_like(x)
+    mask = x > 0
+
+    output = x.masked_fill(mask, -10.0)
+    dual_output = make_dual(x, x_dot).masked_fill(mask, -10.0)
+
+    assert torch.allclose(primal(dual_output), output)
+    torch.testing.assert_close(
+        tangent(dual_output),
+        torch.where(mask, torch.zeros_like(x_dot), x_dot),
+    )
+    _assert_graph_free(tangent(dual_output))
+
+
+def test_native_dropout_dual_reuses_primal_mask() -> None:
+    torch.manual_seed(32)
+    x = torch.randn(4, 5, dtype=torch.float64)
+    x_dot = torch.randn_like(x)
+
+    output, mask = torch.ops.aten.native_dropout.default(make_dual(x, x_dot), 0.4, True)
+
+    expected_tangent = torch.where(
+        mask,
+        x_dot / 0.6,
+        torch.zeros_like(x_dot),
+    )
+    torch.testing.assert_close(tangent(output), expected_tangent)
+    _assert_graph_free(tangent(output))
+
+
 def test_linear_weight_dual_matches_finite_difference() -> None:
     torch.manual_seed(3)
     layer = nn.Linear(4, 3).double()

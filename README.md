@@ -243,9 +243,37 @@ a nanochat-shaped token model that exercises:
 - `torch.sigmoid`, `torch.relu(...).square()`, and tanh logit soft-capping;
 - in-forward `F.cross_entropy(..., ignore_index=-1)`.
 
+The suite also includes a nanoGPT-shaped model copied at the structural level
+from nanoGPT's `model.py`: custom `LayerNorm` implemented with
+`F.layer_norm`, tied token embedding / LM-head weight, learned position
+embedding broadcast over the batch dimension, `ModuleDict`/`ModuleList`
+composition, causal self-attention, `Tensor.split`, residual adds, GELU MLPs,
+tuple model outputs `(logits, loss)`, and in-forward cross entropy. Two local
+paths are tested:
+
+- SDPA/flash-style causal attention with `dropout=0`, checked against an
+  equivalent slow-attention reverse-over-reverse reference because this local
+  PyTorch build does not provide the second derivative of the fused flash
+  attention backward.
+- Slow causal attention with `masked_fill`, softmax, and training-mode dropout,
+  checked directly against reverse-over-reverse on the same realized dropout
+  masks.
+
+Both nanoGPT-shaped ModularHVP runs monkeypatch `torch.autograd.grad` to fail
+inside `modular_hvp`, guarding the one-forward/one-backward graph runtime
+against fallback. The changes needed for this were generic primitive/runtime
+coverage: functional/native LayerNorm records, dropout records using PyTorch's
+saved multiplier, `masked_fill`, `Tensor.split`, broadcast-aware add records,
+and top-level tuple-output handling.
+
 RMSNorm graph support is feature-gated behind the ATen operator exposed by the
 installed torch build. It is not locally executable under torch 2.2.2, so it
 must be validated in the nanochat production environment.
+
+Fused SDPA with nonzero dropout remains unsupported in the public runtime
+because the fused primitive does not expose the realized dropout mask needed to
+mirror the exact primal pass. Use `dropout=0` on the fused path or a decomposed
+slow attention path when dropout must be active.
 
 Performance audit note: after adding the token/GPT-shaped graph coverage, the
 runtime was checked for accidental repetitive computation. The implementation
@@ -478,14 +506,15 @@ Implemented CNN/ResNet forward primitives:
 
 Implemented transformer unfused primitives:
 
-- Tuple/view primitives: `aten.split`, `aten.split_with_sizes`, `aten.slice`,
-  `aten.select`, view/reshape, transpose, contiguous, and chunk-style graph
-  edges.
+- Tuple/view primitives: `aten.split`, `aten.split_with_sizes`, Python
+  `Tensor.split`/`chunk`, `aten.slice`, `aten.select`, view/reshape,
+  transpose, contiguous, and chunk-style graph edges.
 - Attention primitives: matmul/bmm, scalar division, `aten._softmax`, and
-  softmax backward JVPs.
+  softmax backward JVPs. Slow causal masking uses primitive `aten.masked_fill`.
 - Normalization/MLP primitives: `aten.native_layer_norm`, LayerNorm backward
-  JVPs, `aten.gelu`, exact GELU backward JVPs, and eval-mode dropout as an
-  identity edge.
+  JVPs, functional `F.layer_norm` lowered to native LayerNorm records,
+  `aten.gelu`, exact GELU backward JVPs, and training/eval dropout as a
+  primitive linear edge.
 - Embedding forward JVP is implemented in the `DualTensor` backend for
   unfused forward composition tests.
 

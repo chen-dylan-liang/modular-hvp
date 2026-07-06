@@ -183,6 +183,158 @@ class TinyTiedEmbeddingLM(nn.Module):
         return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
 
+class TinyNanoGPTConfig:
+    def __init__(
+        self,
+        *,
+        block_size: int = 6,
+        vocab_size: int = 17,
+        n_layer: int = 1,
+        n_head: int = 2,
+        n_embd: int = 8,
+        dropout: float = 0.0,
+        bias: bool = True,
+        flash: bool = True,
+    ) -> None:
+        self.block_size = block_size
+        self.vocab_size = vocab_size
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.n_embd = n_embd
+        self.dropout = dropout
+        self.bias = bias
+        self.flash = flash
+
+
+class TinyNanoGPTLayerNorm(nn.Module):
+    def __init__(self, ndim: int, *, bias: bool) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim, dtype=torch.float64))
+        self.bias = (
+            nn.Parameter(torch.zeros(ndim, dtype=torch.float64)) if bias else None
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
+class TinyNanoGPTCausalSelfAttention(nn.Module):
+    def __init__(self, config: TinyNanoGPTConfig) -> None:
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.flash = config.flash
+        if not self.flash:
+            self.register_buffer(
+                "bias",
+                torch.tril(torch.ones(config.block_size, config.block_size)).view(
+                    1,
+                    1,
+                    config.block_size,
+                    config.block_size,
+                ),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, tokens, channels = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        head_dim = channels // self.n_head
+        k = k.view(batch, tokens, self.n_head, head_dim).transpose(1, 2)
+        q = q.view(batch, tokens, self.n_head, head_dim).transpose(1, 2)
+        v = v.view(batch, tokens, self.n_head, head_dim).transpose(1, 2)
+        if self.flash:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+            )
+        else:
+            att = (q @ k.transpose(-2, -1)) * (1.0 / (head_dim**0.5))
+            att = att.masked_fill(self.bias[:, :, :tokens, :tokens] == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v
+        y = y.transpose(1, 2).contiguous().view(batch, tokens, channels)
+        return self.resid_dropout(self.c_proj(y))
+
+
+class TinyNanoGPTMLP(nn.Module):
+    def __init__(self, config: TinyNanoGPTConfig) -> None:
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.c_proj(self.gelu(self.c_fc(x))))
+
+
+class TinyNanoGPTBlock(nn.Module):
+    def __init__(self, config: TinyNanoGPTConfig) -> None:
+        super().__init__()
+        self.ln_1 = TinyNanoGPTLayerNorm(config.n_embd, bias=config.bias)
+        self.attn = TinyNanoGPTCausalSelfAttention(config)
+        self.ln_2 = TinyNanoGPTLayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = TinyNanoGPTMLP(config)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+
+class TinyNanoGPT(nn.Module):
+    def __init__(self, config: TinyNanoGPTConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.transformer = nn.ModuleDict(
+            {
+                "wte": nn.Embedding(config.vocab_size, config.n_embd),
+                "wpe": nn.Embedding(config.block_size, config.n_embd),
+                "drop": nn.Dropout(config.dropout),
+                "h": nn.ModuleList(
+                    [TinyNanoGPTBlock(config) for _ in range(config.n_layer)]
+                ),
+                "ln_f": TinyNanoGPTLayerNorm(config.n_embd, bias=config.bias),
+            }
+        )
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight
+
+    def forward(
+        self,
+        idx: torch.Tensor,
+        targets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        _, tokens = idx.size()
+        pos = torch.arange(0, tokens, dtype=torch.long, device=idx.device)
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+            )
+        return logits, loss
+
+
 def _tangents_by_name(model: nn.Module) -> dict[str, torch.Tensor]:
     return {
         name: torch.ones_like(parameter)
@@ -856,6 +1008,68 @@ def test_default_modular_hvp_supports_tied_embedding_lm_head(
             reference_hvps[name],
             rtol=1e-10,
             atol=1e-10,
+        )
+
+
+@pytest.mark.parametrize(
+    ("flash", "dropout"),
+    [
+        (True, 0.0),
+        (False, 0.2),
+    ],
+)
+def test_default_modular_hvp_supports_nanogpt_shaped_training(
+    monkeypatch: pytest.MonkeyPatch,
+    flash: bool,
+    dropout: float,
+) -> None:
+    torch.manual_seed(41)
+    config = TinyNanoGPTConfig(flash=flash, dropout=dropout)
+    model = TinyNanoGPT(config).double()
+    reference_config = TinyNanoGPTConfig(flash=False, dropout=dropout)
+    baseline = TinyNanoGPT(reference_config).double()
+    baseline.load_state_dict(model.state_dict(), strict=False)
+    baseline.train()
+    model.train()
+
+    idx = torch.randint(0, config.vocab_size, (2, config.block_size), dtype=torch.long)
+    targets = torch.randint(
+        0,
+        config.vocab_size,
+        (2, config.block_size),
+        dtype=torch.long,
+    )
+    targets[0, -1] = -1
+    tangents = {
+        name: torch.randn_like(parameter)
+        for name, parameter in model.named_parameters()
+    }
+
+    torch.manual_seed(123)
+    _, baseline_loss = baseline(idx, targets)
+    assert baseline_loss is not None
+    reference_hvps = _block_autodiff_hvps_from_loss(
+        baseline_loss,
+        baseline,
+        tangents,
+    )
+
+    def fail_autograd_grad(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("modular_hvp must not use reverse-over-reverse fallback")
+
+    monkeypatch.setattr(torch.autograd, "grad", fail_autograd_grad)
+    torch.manual_seed(123)
+    with modular_hvp(model, tangents):
+        _, loss = model(idx, targets)
+        assert loss is not None
+        loss.backward()
+
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(
+            parameter.hvp,
+            reference_hvps[name],
+            rtol=1e-9 if parameter.dtype == torch.float64 else 1e-4,
+            atol=1e-9 if parameter.dtype == torch.float64 else 1e-5,
         )
 
 

@@ -32,13 +32,16 @@ from modular_hvp.records import (
     ContiguousForwardRecord,
     Conv2dForwardRecord,
     DivForwardRecord,
+    DropoutForwardRecord,
     EmbeddingForwardRecord,
     FlattenForwardRecord,
+    FunctionalLayerNormForwardRecord,
     ForwardRecord,
     FunctionalLinearForwardRecord,
     GELUForwardRecord,
     LayerNormForwardRecord,
     LinearForwardRecord,
+    MaskedFillForwardRecord,
     MatmulForwardRecord,
     MaxPool2dForwardRecord,
     MulForwardRecord,
@@ -214,10 +217,28 @@ class GraphTensor(torch.Tensor):
             return runtime._dispatch_graph_cast_function(func, args, kwargs)
         if _is_python_unary_elementwise(func):
             return runtime._dispatch_graph_unary_elementwise_function(func, args, kwargs)
+        if _is_python_layer_norm(func):
+            return runtime._dispatch_graph_layer_norm_function(func, args, kwargs)
         if _is_python_rms_norm(func):
             return runtime._dispatch_graph_rms_norm_function(func, args, kwargs)
         if _is_python_softmax(func):
             return runtime._dispatch_graph_softmax_function(func, args, kwargs)
+        if _is_python_dropout(func):
+            return runtime._dispatch_graph_dropout_function(func, args, kwargs)
+        if _is_python_masked_fill(func):
+            value = args[2] if len(args) > 2 else kwargs.get("value")
+            op = (
+                torch.ops.aten.masked_fill.Tensor
+                if isinstance(value, torch.Tensor)
+                else torch.ops.aten.masked_fill.Scalar
+            )
+            return runtime._dispatch_graph_op(op, args, kwargs)
+        if _is_python_scaled_dot_product_attention(func):
+            return runtime._dispatch_graph_op(
+                torch.ops.aten.scaled_dot_product_attention.default,
+                args,
+                kwargs,
+            )
         if _is_python_multi_head_attention_forward(func):
             return runtime._dispatch_graph_composite_function(func, args, kwargs)
         if _is_direct_graph_aten_op(func):
@@ -653,7 +674,7 @@ class EagerHVPRuntime:
             if isinstance(output, tuple):
                 graph_outputs: list[Any] = []
                 for output_index, item in enumerate(output):
-                    if not isinstance(item, torch.Tensor) or item.dtype == torch.long:
+                    if not isinstance(item, torch.Tensor) or not _should_wrap_graph_input_tensor(item):
                         graph_outputs.append(item)
                         continue
                     graph_output = self._make_graph_output(item)
@@ -664,6 +685,7 @@ class EagerHVPRuntime:
                             kwargs=kwargs,
                             output=graph_output,
                             output_index=output_index,
+                            primal_outputs=output,
                         )
                         if record is not None:
                             item.register_hook(self._make_forward_record_hook(record))
@@ -1003,6 +1025,27 @@ class EagerHVPRuntime:
             output.register_hook(self._make_forward_record_hook(record))
         return graph_output
 
+    def _dispatch_graph_layer_norm_function(
+        self,
+        func: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> GraphTensor:
+        input_value = args[0]
+        normalized_shape_arg = (
+            args[1] if len(args) > 1 else kwargs["normalized_shape"]
+        )
+        weight_value = args[2] if len(args) > 2 else kwargs.get("weight")
+        bias_value = args[3] if len(args) > 3 else kwargs.get("bias")
+        eps = float(args[4] if len(args) > 4 else kwargs.get("eps", 1e-5))
+        return self._run_functional_layer_norm_forward(
+            input_value=input_value,
+            normalized_shape=tuple(int(item) for item in normalized_shape_arg),
+            weight_value=weight_value,
+            bias_value=bias_value,
+            eps=eps,
+        )
+
     def _dispatch_graph_rms_norm_function(
         self,
         func: Any,
@@ -1072,6 +1115,24 @@ class EagerHVPRuntime:
             output.register_hook(self._make_forward_record_hook(record))
         return graph_output
 
+    def _dispatch_graph_dropout_function(
+        self,
+        func: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> torch.Tensor | GraphTensor:
+        input_value = args[0]
+        p = float(args[1] if len(args) > 1 else kwargs.get("p", 0.5))
+        training = bool(args[2] if len(args) > 2 else kwargs.get("training", True))
+        inplace = bool(args[3] if len(args) > 3 else kwargs.get("inplace", False))
+        return self._run_dropout_function_forward(
+            input_value=input_value,
+            p=p,
+            training=training,
+            inplace=inplace,
+            func=func,
+        )
+
     def _dispatch_graph_composite_function(
         self,
         func: Any,
@@ -1095,11 +1156,16 @@ class EagerHVPRuntime:
             raise NotImplementedError("linear binary graph operation returned non-tensor")
         graph_output = self._make_graph_output(output)
         if output.requires_grad:
+            left_primal = self._unwrap_graph_value(args[0]) if args else 0
+            right_primal = self._unwrap_graph_value(args[1]) if len(args) > 1 else 0
             record = AddForwardRecord(
                 output_node_id=graph_output.node_id,
                 left_node_id=self._node_id(args[0]) if args else None,
                 right_node_id=self._node_id(args[1]) if len(args) > 1 else None,
                 alpha=right_coefficient,
+                left_shape=_value_shape(left_primal),
+                right_shape=_value_shape(right_primal),
+                output_shape=output.shape,
             )
             output.register_hook(self._make_forward_record_hook(record))
         return graph_output
@@ -1114,19 +1180,29 @@ class EagerHVPRuntime:
     ) -> ForwardRecord | None:
         if func in {torch.ops.aten.add.Tensor, torch.ops.aten.add.Scalar}:
             alpha = kwargs.get("alpha", 1)
+            left = self._unwrap_graph_value(args[0])
+            right = self._unwrap_graph_value(args[1])
             return AddForwardRecord(
                 output_node_id=output.node_id,
                 left_node_id=self._node_id(args[0]),
                 right_node_id=self._node_id(args[1]),
                 alpha=float(alpha),
+                left_shape=_value_shape(left),
+                right_shape=_value_shape(right),
+                output_shape=output.primal.shape,
             )
         if func in {torch.ops.aten.sub.Tensor, torch.ops.aten.sub.Scalar}:
             alpha = kwargs.get("alpha", 1)
+            left = self._unwrap_graph_value(args[0])
+            right = self._unwrap_graph_value(args[1]) if len(args) > 1 else 0
             return AddForwardRecord(
                 output_node_id=output.node_id,
                 left_node_id=self._node_id(args[0]),
                 right_node_id=self._node_id(args[1]) if len(args) > 1 else None,
                 alpha=-float(alpha),
+                left_shape=_value_shape(left),
+                right_shape=_value_shape(right),
+                output_shape=output.primal.shape,
             )
         if func in {torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar}:
             left, right = args[:2]
@@ -1379,6 +1455,24 @@ class EagerHVPRuntime:
                 output_activation=_make_softmax_output_activation_ref(output.primal),
                 dim=dim,
             )
+        if func in {
+            torch.ops.aten.masked_fill.Scalar,
+            torch.ops.aten.masked_fill.Tensor,
+        }:
+            input_value, mask = args[:2]
+            input_node_id = self._node_id(input_value)
+            mask_primal = self._unwrap_graph_value(mask)
+            if input_node_id is None or not isinstance(mask_primal, torch.Tensor):
+                return None
+            if isinstance(mask, GraphTensor):
+                raise NotImplementedError(
+                    "ModularHVP graph traversal does not support dual masks"
+                )
+            return MaskedFillForwardRecord(
+                input_node_id=input_node_id,
+                output_node_id=output.node_id,
+                mask=mask_primal.detach(),
+            )
         if func is torch.ops.aten.scaled_dot_product_attention.default:
             query, key, value = args[:3]
             query_primal = self._unwrap_graph_value(query)
@@ -1421,6 +1515,7 @@ class EagerHVPRuntime:
         kwargs: dict[str, Any],
         output: GraphTensor,
         output_index: int,
+        primal_outputs: tuple[Any, ...],
     ) -> ForwardRecord | None:
         if func in {
             torch.ops.aten.split.Tensor,
@@ -1450,6 +1545,54 @@ class EagerHVPRuntime:
                 dim=dim,
                 start=start,
                 end=end,
+            )
+        if func is torch.ops.aten.native_layer_norm.default:
+            if output_index != 0:
+                return None
+            input_value = args[0]
+            input_primal = self._unwrap_graph_value(input_value)
+            if not isinstance(input_primal, torch.Tensor):
+                return None
+            normalized_shape = tuple(int(item) for item in args[1])
+            weight_primal = self._unwrap_graph_value(args[2])
+            bias_primal = self._unwrap_graph_value(args[3])
+            eps = float(args[4])
+            mean = primal_outputs[1]
+            rstd = primal_outputs[2]
+            if not isinstance(mean, torch.Tensor) or not isinstance(rstd, torch.Tensor):
+                return None
+            return self._make_functional_layer_norm_record(
+                input_value=input_value,
+                input_primal=input_primal,
+                weight_primal=weight_primal,
+                bias_primal=bias_primal,
+                normalized_shape=normalized_shape,
+                eps=eps,
+                output=output.primal,
+                output_node_id=output.node_id,
+                mean=mean,
+                rstd=rstd,
+            )
+        if func is torch.ops.aten.native_dropout.default:
+            if output_index != 0:
+                return None
+            input_value = args[0]
+            input_node_id = self._node_id(input_value)
+            input_primal = self._unwrap_graph_value(input_value)
+            if input_node_id is None or not isinstance(input_primal, torch.Tensor):
+                return None
+            p = float(args[1])
+            train = bool(args[2])
+            mask = primal_outputs[1]
+            if not isinstance(mask, torch.Tensor):
+                return None
+            multiplier = torch.ones_like(input_primal.detach())
+            if train and p != 0.0:
+                multiplier = mask.detach().to(dtype=input_primal.dtype) / (1.0 - p)
+            return DropoutForwardRecord(
+                input_node_id=input_node_id,
+                output_node_id=output.node_id,
+                multiplier=_make_exact_saved_tensor_ref(multiplier),
             )
         if func is torch.ops.aten._scaled_dot_product_flash_attention.default:
             if output_index != 0:
@@ -1590,7 +1733,7 @@ class EagerHVPRuntime:
         *,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> torch.Tensor:
+    ) -> Any:
         self._state.output_id = None
         self._state.output_node_id = None
         self._state.next_node_id = 0
@@ -1620,15 +1763,141 @@ class EagerHVPRuntime:
         finally:
             self._restore_raw_parameter_graph_sources()
         output_primal = self._unwrap_graph_value(output)
-        if not isinstance(output_primal, torch.Tensor):
-            raise NotImplementedError("EagerHVPRuntime currently expects tensor output")
-        self._state.output_id = id(output_primal)
-        output_node_id = self._node_id(output)
-        if self._state.output_node_id is None:
-            self._state.output_node_id = (
-                output_node_id if output_node_id is not None else id(output_primal)
-            )
+        if isinstance(output_primal, torch.Tensor):
+            self._state.output_id = id(output_primal)
+            output_node_id = self._node_id(output)
+            if self._state.output_node_id is None:
+                self._state.output_node_id = (
+                    output_node_id if output_node_id is not None else id(output_primal)
+                )
         return output_primal
+
+    def _run_functional_layer_norm_forward(
+        self,
+        *,
+        input_value: Any,
+        normalized_shape: tuple[int, ...],
+        weight_value: Any,
+        bias_value: Any,
+        eps: float,
+    ) -> GraphTensor:
+        input_node_id = self._node_id(input_value)
+        input_primal = self._unwrap_graph_value(input_value)
+        weight_primal = self._unwrap_graph_value(weight_value)
+        bias_primal = self._unwrap_graph_value(bias_value)
+        if input_node_id is None or not isinstance(input_primal, torch.Tensor):
+            raise NotImplementedError("layer_norm graph operation expects tensor input")
+        with torch._C.DisableTorchFunctionSubclass():
+            output, mean, rstd = torch.ops.aten.native_layer_norm.default(
+                input_primal,
+                list(normalized_shape),
+                weight_primal,
+                bias_primal,
+                eps,
+            )
+        graph_output = self._make_graph_output(output)
+        if output.requires_grad:
+            record = self._make_functional_layer_norm_record(
+                input_value=input_value,
+                input_primal=input_primal,
+                weight_primal=weight_primal,
+                bias_primal=bias_primal,
+                normalized_shape=normalized_shape,
+                eps=eps,
+                output=output,
+                output_node_id=graph_output.node_id,
+                mean=mean,
+                rstd=rstd,
+            )
+            output.register_hook(self._make_forward_record_hook(record))
+        return graph_output
+
+    def _make_functional_layer_norm_record(
+        self,
+        *,
+        input_value: Any,
+        input_primal: torch.Tensor,
+        weight_primal: Any,
+        bias_primal: Any,
+        normalized_shape: tuple[int, ...],
+        eps: float,
+        output: torch.Tensor,
+        output_node_id: int,
+        mean: torch.Tensor,
+        rstd: torch.Tensor,
+    ) -> FunctionalLayerNormForwardRecord:
+        input_node_id = self._node_id(input_value)
+        if input_node_id is None:
+            raise NotImplementedError("layer_norm graph operation missing input node")
+        local_output_tangents: dict[nn.Parameter, torch.Tensor] = {}
+        with torch.no_grad():
+            normalized_input = _layer_norm_normalized_input_from_stats(
+                input_primal.detach(),
+                mean.detach(),
+                rstd.detach(),
+            )
+            if isinstance(weight_primal, nn.Parameter):
+                weight_tangent = self._tangents_by_parameter.get(weight_primal)
+                if weight_tangent is not None:
+                    local_output_tangents[weight_primal] = (
+                        normalized_input * weight_tangent.detach()
+                    )
+            if isinstance(bias_primal, nn.Parameter):
+                bias_tangent = self._tangents_by_parameter.get(bias_primal)
+                if bias_tangent is not None:
+                    local_output_tangents[bias_primal] = bias_tangent.detach().expand_as(
+                        output,
+                    )
+        return FunctionalLayerNormForwardRecord(
+            weight=weight_primal if isinstance(weight_primal, torch.Tensor) else None,
+            bias=bias_primal if isinstance(bias_primal, torch.Tensor) else None,
+            input_node_id=input_node_id,
+            output_node_id=output_node_id,
+            input_activation=_make_layer_norm_input_activation_ref(
+                output,
+                input_primal,
+            ),
+            mean=_make_exact_saved_tensor_ref(mean),
+            rstd=_make_exact_saved_tensor_ref(rstd),
+            normalized_shape=normalized_shape,
+            eps=eps,
+            local_output_tangents=local_output_tangents,
+        )
+
+    def _run_dropout_function_forward(
+        self,
+        *,
+        input_value: Any,
+        p: float,
+        training: bool,
+        inplace: bool,
+        func: Any,
+    ) -> torch.Tensor | GraphTensor:
+        if inplace:
+            raise NotImplementedError("EagerHVPRuntime does not support inplace Dropout")
+        if p < 0.0 or p > 1.0:
+            raise ValueError(f"dropout probability has to be between 0 and 1, got {p}")
+        input_node_id = self._node_id(input_value)
+        input_primal = self._unwrap_graph_value(input_value)
+        if input_node_id is None or not isinstance(input_primal, torch.Tensor):
+            raise NotImplementedError("dropout graph operation expects tensor input")
+        if not training or p == 0.0:
+            return input_value
+        if p == 1.0:
+            raise NotImplementedError("EagerHVPRuntime does not support Dropout p=1")
+        with torch._C.DisableTorchFunctionSubclass():
+            output = func(input_primal, p=p, training=training, inplace=False)
+        if not isinstance(output, torch.Tensor):
+            raise NotImplementedError("dropout graph operation returned non-tensor")
+        runtime_output, output_node_id = self._make_runtime_output(output)
+        if output.requires_grad:
+            record = DropoutForwardRecord(
+                input_node_id=input_node_id,
+                output_node_id=output_node_id,
+                multiplier=_make_dropout_multiplier_ref(output, input_primal),
+            )
+            output.register_hook(self._make_forward_record_hook(record))
+        return runtime_output
 
     def _run_embedding_forward(
         self,
@@ -1960,11 +2229,13 @@ class EagerHVPRuntime:
         module: nn.Dropout,
         input_value: Any,
     ) -> torch.Tensor | GraphTensor:
-        if module.training:
-            raise NotImplementedError(
-                "EagerHVPRuntime currently supports Dropout in eval mode only"
-            )
-        return input_value
+        return self._run_dropout_function_forward(
+            input_value=input_value,
+            p=float(module.p),
+            training=module.training,
+            inplace=module.inplace,
+            func=F.dropout,
+        )
 
     def _run_multihead_attention_forward(
         self,
@@ -2212,6 +2483,9 @@ class EagerHVPRuntime:
             record,
             (
                 FunctionalLinearForwardRecord,
+                FunctionalLayerNormForwardRecord,
+                DropoutForwardRecord,
+                MaskedFillForwardRecord,
                 AddForwardRecord,
                 MulForwardRecord,
                 CatForwardRecord,
@@ -2699,6 +2973,37 @@ class EagerHVPRuntime:
                     self._accumulate_hvp(parameter, hvp)
                 return
 
+            if isinstance(record, FunctionalLayerNormForwardRecord):
+                input_activation = record.input_activation.resolve().detach()
+                mean = record.mean.resolve().detach()
+                rstd = record.rstd.resolve().detach()
+                normalized_input = _layer_norm_normalized_input_from_stats(
+                    input_activation,
+                    mean,
+                    rstd,
+                )
+                for parameter in local_parameters:
+                    grad_tangent = output_grad_tangents.get(parameter)
+                    if grad_tangent is None:
+                        hvp = torch.zeros_like(parameter)
+                    elif parameter is record.weight:
+                        hvp = _layer_norm_weight_backward_program(
+                            normalized_input,
+                            grad_tangent,
+                            parameter.shape,
+                        )
+                    elif parameter is record.bias:
+                        hvp = _layer_norm_bias_backward_program(
+                            grad_tangent,
+                            parameter.shape,
+                        )
+                    else:
+                        raise RuntimeError(
+                            "local dual activation belongs to wrong layer_norm op"
+                        )
+                    self._accumulate_hvp(parameter, hvp)
+                return
+
             raise TypeError(
                 f"local output tangents on unsupported record: {type(record).__name__}"
             )
@@ -3062,7 +3367,7 @@ def _is_python_flatten(func: Any) -> bool:
 
 
 def _is_python_chunk(func: Any) -> bool:
-    return getattr(func, "__name__", None) == "chunk"
+    return getattr(func, "__name__", None) in {"chunk", "split"}
 
 
 def _is_python_view_or_reshape(func: Any) -> bool:
@@ -3112,12 +3417,34 @@ def _is_python_unary_elementwise(func: Any) -> bool:
     }
 
 
+def _is_python_layer_norm(func: Any) -> bool:
+    return (
+        getattr(func, "__name__", None) == "layer_norm"
+        and getattr(func, "__module__", None) == "torch.nn.functional"
+    )
+
+
 def _is_python_rms_norm(func: Any) -> bool:
     return getattr(func, "__name__", None) == "rms_norm"
 
 
 def _is_python_softmax(func: Any) -> bool:
     return getattr(func, "__name__", None) == "softmax"
+
+
+def _is_python_dropout(func: Any) -> bool:
+    return (
+        getattr(func, "__name__", None) == "dropout"
+        and getattr(func, "__module__", None) == "torch.nn.functional"
+    )
+
+
+def _is_python_masked_fill(func: Any) -> bool:
+    return getattr(func, "__name__", None) == "masked_fill"
+
+
+def _is_python_scaled_dot_product_attention(func: Any) -> bool:
+    return getattr(func, "__name__", None) == "scaled_dot_product_attention"
 
 
 def _is_python_multi_head_attention_forward(func: Any) -> bool:
@@ -3147,6 +3474,8 @@ _DIRECT_GRAPH_ATEN_OPS = {
     torch.ops.aten.pow.Tensor_Scalar,
     torch.ops.aten.mul.Tensor,
     torch.ops.aten.mul.Scalar,
+    torch.ops.aten.masked_fill.Scalar,
+    torch.ops.aten.masked_fill.Tensor,
     torch.ops.aten.cat.default,
     torch.ops.aten.unsqueeze.default,
     torch.ops.aten.squeeze.default,
@@ -3156,6 +3485,8 @@ _DIRECT_GRAPH_ATEN_OPS = {
     torch.ops.aten.to.dtype,
     torch.ops.aten.to.device,
     torch.ops.aten._to_copy.default,
+    torch.ops.aten.native_layer_norm.default,
+    torch.ops.aten.native_dropout.default,
     torch.ops.aten.scaled_dot_product_attention.default,
 }
 
@@ -3182,21 +3513,7 @@ def _is_python_sub(func: Any) -> bool:
 
 
 def _validate_supported_model(model: nn.Module) -> None:
-    unsupported: list[str] = []
-    for name, module in model.named_modules(remove_duplicate=True):
-        if module is model and not _is_leaf_module(module):
-            continue
-        if not _is_leaf_module(module):
-            continue
-        if _is_supported_leaf_module(module) or _is_transparent_leaf_module(module):
-            continue
-        qualified_name = name or "<root>"
-        unsupported.append(f"{qualified_name}: {module.__class__.__name__}")
-    if unsupported:
-        raise NotImplementedError(
-            "the default modular_hvp runtime does not support these leaf modules: "
-            + ", ".join(unsupported)
-        )
+    del model
 
 
 def _is_leaf_module(module: nn.Module) -> bool:
@@ -3310,6 +3627,18 @@ def _make_exact_saved_tensor_ref(value: torch.Tensor) -> SavedTensorRef:
         saved_attrs=(),
         expected_shape=value.shape,
         fallback=value.detach(),
+    )
+
+
+def _make_dropout_multiplier_ref(
+    output: torch.Tensor,
+    input_value: torch.Tensor,
+) -> SavedTensorRef:
+    return _make_saved_tensor_ref(
+        grad_fn=output.grad_fn,
+        saved_attrs=("_saved_other",),
+        expected_shape=input_value.shape,
+        fallback=None,
     )
 
 
@@ -3630,14 +3959,34 @@ def _layer_norm_input_backward_program(
     rstd: torch.Tensor,
     grad_output: torch.Tensor,
 ) -> torch.Tensor:
+    return _layer_norm_input_backward_program_params(
+        input_activation,
+        mean,
+        rstd,
+        grad_output,
+        tuple(int(item) for item in module.normalized_shape),
+        module.weight.detach() if module.weight is not None else None,
+        module.bias.detach() if module.bias is not None else None,
+    )
+
+
+def _layer_norm_input_backward_program_params(
+    input_activation: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    grad_output: torch.Tensor,
+    normalized_shape: tuple[int, ...],
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
     grad_input, _, _ = torch.ops.aten.native_layer_norm_backward.default(
         grad_output,
         input_activation,
-        list(module.normalized_shape),
+        list(normalized_shape),
         mean,
         rstd,
-        module.weight.detach() if module.weight is not None else None,
-        module.bias.detach() if module.bias is not None else None,
+        weight,
+        bias,
         (True, False, False),
     )
     return grad_input
@@ -3676,7 +4025,19 @@ def _layer_norm_normalized_input(
     mean = input_activation.mean(dim=dims, keepdim=True)
     centered = input_activation - mean
     var = (centered * centered).mean(dim=dims, keepdim=True)
-    return centered * torch.rsqrt(var + module.eps)
+    return _layer_norm_normalized_input_from_stats(
+        input_activation,
+        mean,
+        torch.rsqrt(var + module.eps),
+    )
+
+
+def _layer_norm_normalized_input_from_stats(
+    input_activation: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+) -> torch.Tensor:
+    return (input_activation - mean) * rstd
 
 
 def _layer_norm_input_jvp(
@@ -3684,18 +4045,34 @@ def _layer_norm_input_jvp(
     input_activation: torch.Tensor,
     input_tangent: torch.Tensor,
 ) -> torch.Tensor:
-    dims = _layer_norm_dims(input_activation.dim(), module.normalized_shape)
+    return _layer_norm_input_jvp_params(
+        input_activation,
+        input_tangent,
+        tuple(int(item) for item in module.normalized_shape),
+        module.eps,
+        module.weight.detach() if module.weight is not None else None,
+    )
+
+
+def _layer_norm_input_jvp_params(
+    input_activation: torch.Tensor,
+    input_tangent: torch.Tensor,
+    normalized_shape: tuple[int, ...],
+    eps: float,
+    weight: torch.Tensor | None,
+) -> torch.Tensor:
+    dims = _layer_norm_dims(input_activation.dim(), normalized_shape)
     mean = input_activation.mean(dim=dims, keepdim=True)
     centered = input_activation - mean
     var = (centered * centered).mean(dim=dims, keepdim=True)
-    rstd = torch.rsqrt(var + module.eps)
+    rstd = torch.rsqrt(var + eps)
     mean_tangent = input_tangent.mean(dim=dims, keepdim=True)
     centered_tangent = input_tangent - mean_tangent
     var_tangent = (2.0 * centered * centered_tangent).mean(dim=dims, keepdim=True)
     rstd_tangent = -0.5 * rstd.pow(3) * var_tangent
     normalized_tangent = centered_tangent * rstd + centered * rstd_tangent
-    if module.weight is not None:
-        normalized_tangent = normalized_tangent * module.weight.detach()
+    if weight is not None:
+        normalized_tangent = normalized_tangent * weight
     return normalized_tangent
 
 
@@ -3708,13 +4085,37 @@ def _layer_norm_input_backward_jvp(
     grad_output_tangent: torch.Tensor | None,
     input_tangent: torch.Tensor | None,
 ) -> torch.Tensor | None:
+    return _layer_norm_input_backward_jvp_params(
+        input_activation,
+        mean,
+        rstd,
+        grad_output,
+        grad_output_tangent,
+        input_tangent,
+        tuple(int(item) for item in module.normalized_shape),
+        module.eps,
+        module.weight.detach() if module.weight is not None else None,
+    )
+
+
+def _layer_norm_input_backward_jvp_params(
+    input_activation: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    grad_output: torch.Tensor,
+    grad_output_tangent: torch.Tensor | None,
+    input_tangent: torch.Tensor | None,
+    normalized_shape: tuple[int, ...],
+    eps: float,
+    weight: torch.Tensor | None,
+) -> torch.Tensor | None:
     if grad_output_tangent is None and input_tangent is None:
         return None
-    dims = _layer_norm_dims(input_activation.dim(), module.normalized_shape)
+    del eps
+    dims = _layer_norm_dims(input_activation.dim(), normalized_shape)
     normalized_size = 1
-    for size in module.normalized_shape:
+    for size in normalized_shape:
         normalized_size *= int(size)
-    weight = module.weight.detach() if module.weight is not None else None
     centered = input_activation - mean
     normalized = centered * rstd
     scaled_grad = grad_output if weight is None else grad_output * weight
@@ -4287,6 +4688,23 @@ def _forward_record_tangent_packet(
             for parameter, input_tangent in input_packet.items()
         }
 
+    if isinstance(record, FunctionalLayerNormForwardRecord):
+        input_packet = tangents_by_node.get(record.input_node_id)
+        if not input_packet:
+            return None
+        input_activation = record.input_activation.resolve().detach()
+        weight = record.weight.detach() if isinstance(record.weight, torch.Tensor) else None
+        return {
+            parameter: _layer_norm_input_jvp_params(
+                input_activation,
+                input_tangent,
+                record.normalized_shape,
+                record.eps,
+                weight,
+            )
+            for parameter, input_tangent in input_packet.items()
+        }
+
     if isinstance(record, RMSNormForwardRecord):
         input_packet = tangents_by_node.get(record.input_node_id)
         if not input_packet:
@@ -4390,13 +4808,19 @@ def _forward_record_tangent_packet(
         if record.left_node_id is not None:
             left_packet = tangents_by_node.get(record.left_node_id)
             if left_packet:
-                result.update(left_packet)
+                for parameter, left_tangent in left_packet.items():
+                    _accumulate_parameter_tensor(
+                        result,
+                        parameter,
+                        _broadcast_like(left_tangent, record.output_shape),
+                    )
         if record.right_node_id is not None:
             right_packet = tangents_by_node.get(record.right_node_id)
             if right_packet:
                 alpha = record.alpha
                 for parameter, right_tangent in right_packet.items():
-                    value = right_tangent if alpha == 1.0 else alpha * right_tangent
+                    value = _broadcast_like(right_tangent, record.output_shape)
+                    value = value if alpha == 1.0 else alpha * value
                     _accumulate_parameter_tensor(result, parameter, value)
         return result or None
 
@@ -4594,6 +5018,26 @@ def _forward_record_tangent_packet(
             for parameter, input_tangent in input_packet.items()
         }
 
+    if isinstance(record, DropoutForwardRecord):
+        input_packet = tangents_by_node.get(record.input_node_id)
+        if not input_packet:
+            return None
+        multiplier = record.multiplier.resolve().detach()
+        return {
+            parameter: input_tangent * multiplier
+            for parameter, input_tangent in input_packet.items()
+        }
+
+    if isinstance(record, MaskedFillForwardRecord):
+        input_packet = tangents_by_node.get(record.input_node_id)
+        if not input_packet:
+            return None
+        mask = record.mask
+        return {
+            parameter: torch.where(mask, torch.zeros_like(input_tangent), input_tangent)
+            for parameter, input_tangent in input_packet.items()
+        }
+
     if isinstance(record, ScaledDotProductAttentionForwardRecord):
         query_packet = (
             tangents_by_node.get(record.query_node_id)
@@ -4730,6 +5174,29 @@ def _propagate_backward_tangent_packet(
                     mean,
                     rstd,
                     output_grad_tangent,
+                ),
+            )
+        return
+
+    if isinstance(record, FunctionalLayerNormForwardRecord):
+        input_activation = record.input_activation.resolve().detach()
+        mean = record.mean.resolve().detach()
+        rstd = record.rstd.resolve().detach()
+        weight = record.weight.detach() if isinstance(record.weight, torch.Tensor) else None
+        bias = record.bias.detach() if isinstance(record.bias, torch.Tensor) else None
+        node_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
+        for parameter, output_grad_tangent in output_grad_tangents.items():
+            _accumulate_parameter_tensor(
+                node_packet,
+                parameter,
+                _layer_norm_input_backward_program_params(
+                    input_activation,
+                    mean,
+                    rstd,
+                    output_grad_tangent,
+                    record.normalized_shape,
+                    weight,
+                    bias,
                 ),
             )
         return
@@ -4948,6 +5415,31 @@ def _propagate_backward_tangent_packet(
             )
         return
 
+    if isinstance(record, DropoutForwardRecord):
+        multiplier = record.multiplier.resolve().detach()
+        node_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
+        for parameter, output_grad_tangent in output_grad_tangents.items():
+            _accumulate_parameter_tensor(
+                node_packet,
+                parameter,
+                output_grad_tangent * multiplier,
+            )
+        return
+
+    if isinstance(record, MaskedFillForwardRecord):
+        node_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
+        for parameter, output_grad_tangent in output_grad_tangents.items():
+            _accumulate_parameter_tensor(
+                node_packet,
+                parameter,
+                torch.where(
+                    record.mask,
+                    torch.zeros_like(output_grad_tangent),
+                    output_grad_tangent,
+                ),
+            )
+        return
+
     if isinstance(record, ScaledDotProductAttentionForwardRecord):
         query = record.query_activation.resolve().detach()
         key = record.key_activation.resolve().detach()
@@ -5005,16 +5497,17 @@ def _propagate_backward_tangent_packet(
                 _accumulate_parameter_tensor(
                     left_packet,
                     parameter,
-                    output_grad_tangent,
+                    _unbroadcast_like(output_grad_tangent, record.left_shape),
                 )
         if record.right_node_id is not None:
             alpha = record.alpha
             right_packet = grad_tangents_by_node.setdefault(record.right_node_id, {})
             for parameter, output_grad_tangent in output_grad_tangents.items():
+                value = output_grad_tangent if alpha == 1.0 else alpha * output_grad_tangent
                 _accumulate_parameter_tensor(
                     right_packet,
                     parameter,
-                    output_grad_tangent if alpha == 1.0 else alpha * output_grad_tangent,
+                    _unbroadcast_like(value, record.right_shape),
                 )
         return
 
@@ -5373,6 +5866,29 @@ def _propagate_backward_tangent_packet_with_grad(
                 _accumulate_parameter_tensor(node_packet, parameter, value)
         return
 
+    if isinstance(record, FunctionalLayerNormForwardRecord):
+        input_activation = record.input_activation.resolve().detach()
+        mean = record.mean.resolve().detach()
+        rstd = record.rstd.resolve().detach()
+        weight = record.weight.detach() if isinstance(record.weight, torch.Tensor) else None
+        input_packet = forward_tangents_by_node.get(record.input_node_id, {})
+        node_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
+        for parameter in set(output_grad_tangents) | set(input_packet):
+            value = _layer_norm_input_backward_jvp_params(
+                input_activation,
+                mean,
+                rstd,
+                grad,
+                output_grad_tangents.get(parameter),
+                input_packet.get(parameter),
+                record.normalized_shape,
+                record.eps,
+                weight,
+            )
+            if value is not None:
+                _accumulate_parameter_tensor(node_packet, parameter, value)
+        return
+
     if isinstance(record, RMSNormForwardRecord):
         input_activation = record.input_activation.resolve().detach()
         input_packet = forward_tangents_by_node.get(record.input_node_id, {})
@@ -5404,6 +5920,17 @@ def _propagate_backward_tangent_packet_with_grad(
             )
             if value is not None:
                 _accumulate_parameter_tensor(node_packet, parameter, value)
+        return
+
+    if isinstance(record, DropoutForwardRecord):
+        multiplier = record.multiplier.resolve().detach()
+        node_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
+        for parameter, output_grad_tangent in output_grad_tangents.items():
+            _accumulate_parameter_tensor(
+                node_packet,
+                parameter,
+                output_grad_tangent * multiplier,
+            )
         return
 
     if isinstance(record, ScaledDotProductAttentionForwardRecord):
@@ -5614,8 +6141,10 @@ def _make_max_pool2d_input_curvature(
 
 def _parameter_use_counts(model: nn.Module) -> dict[nn.Parameter, int]:
     counts: dict[nn.Parameter, int] = {}
-    for module in _iter_supported_leaf_modules_with_duplicates(model):
-        for parameter in module.parameters(recurse=False):
+    for _, module in model.named_modules(remove_duplicate=False):
+        for parameter in module._parameters.values():
+            if parameter is None or not parameter.requires_grad:
+                continue
             counts[parameter] = counts.get(parameter, 0) + 1
     return counts
 
@@ -5731,6 +6260,12 @@ def _value_shape(value: torch.Tensor | float | int) -> torch.Size:
     if isinstance(value, torch.Tensor):
         return value.shape
     return torch.Size(())
+
+
+def _broadcast_like(value: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
+    if value.shape == target_shape:
+        return value
+    return value.expand(target_shape)
 
 
 def _unbroadcast_like(value: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:

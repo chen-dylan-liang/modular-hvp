@@ -66,6 +66,20 @@ class LayerNormForwardRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class FunctionalLayerNormForwardRecord:
+    weight: nn.Parameter | torch.Tensor | None
+    bias: nn.Parameter | torch.Tensor | None
+    input_node_id: int
+    output_node_id: int
+    input_activation: SavedTensorRef
+    mean: SavedTensorRef
+    rstd: SavedTensorRef
+    normalized_shape: tuple[int, ...]
+    eps: float
+    local_output_tangents: dict[nn.Parameter, torch.Tensor]
+
+
+@dataclass(frozen=True, slots=True)
 class RMSNormForwardRecord:
     input_node_id: int
     output_node_id: int
@@ -129,6 +143,9 @@ class AddForwardRecord:
     left_node_id: int | None
     right_node_id: int | None
     alpha: float
+    left_shape: torch.Size
+    right_shape: torch.Size
+    output_shape: torch.Size
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +251,20 @@ class SoftmaxForwardRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class DropoutForwardRecord:
+    input_node_id: int
+    output_node_id: int
+    multiplier: SavedTensorRef
+
+
+@dataclass(frozen=True, slots=True)
+class MaskedFillForwardRecord:
+    input_node_id: int
+    output_node_id: int
+    mask: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
 class ScaledDotProductAttentionForwardRecord:
     query_node_id: int | None
     key_node_id: int | None
@@ -254,6 +285,7 @@ ForwardRecord = (
     | Conv2dForwardRecord
     | BatchNorm2dForwardRecord
     | LayerNormForwardRecord
+    | FunctionalLayerNormForwardRecord
     | RMSNormForwardRecord
     | ReLUForwardRecord
     | GELUForwardRecord
@@ -274,6 +306,8 @@ ForwardRecord = (
     | MatmulForwardRecord
     | DivForwardRecord
     | SoftmaxForwardRecord
+    | DropoutForwardRecord
+    | MaskedFillForwardRecord
     | ScaledDotProductAttentionForwardRecord
 )
 
@@ -353,6 +387,7 @@ def _record_local_output_tangents(
             FunctionalLinearForwardRecord,
             Conv2dForwardRecord,
             BatchNorm2dForwardRecord,
+            FunctionalLayerNormForwardRecord,
         ),
     ):
         return record.local_output_tangents
@@ -373,6 +408,7 @@ def _record_input_node_ids(record: ForwardRecord) -> tuple[int, ...]:
             Conv2dForwardRecord,
             BatchNorm2dForwardRecord,
             LayerNormForwardRecord,
+            FunctionalLayerNormForwardRecord,
             RMSNormForwardRecord,
             ReLUForwardRecord,
             GELUForwardRecord,
@@ -388,6 +424,8 @@ def _record_input_node_ids(record: ForwardRecord) -> tuple[int, ...]:
             CastForwardRecord,
             UnaryElementwiseForwardRecord,
             SoftmaxForwardRecord,
+            DropoutForwardRecord,
+            MaskedFillForwardRecord,
         ),
     ):
         return (record.input_node_id,)

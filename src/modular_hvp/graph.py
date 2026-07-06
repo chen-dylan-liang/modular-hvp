@@ -10,7 +10,9 @@ from torch import nn
 
 from modular_hvp.records import (
     DivForwardRecord,
+    DropoutForwardRecord,
     ForwardRecord,
+    FunctionalLayerNormForwardRecord,
     GELUForwardRecord,
     LayerNormForwardRecord,
     MatmulForwardRecord,
@@ -251,7 +253,15 @@ def _graph_forward_tangent_retained_node_ids(
     for record in records:
         if retain_local_parameter_inputs and _record_local_output_tangents(record):
             retained.update(_record_input_node_ids(record))
-        if isinstance(record, (GELUForwardRecord, LayerNormForwardRecord, RMSNormForwardRecord)):
+        if isinstance(
+            record,
+            (
+                GELUForwardRecord,
+                LayerNormForwardRecord,
+                FunctionalLayerNormForwardRecord,
+                RMSNormForwardRecord,
+            ),
+        ):
             retained.add(record.input_node_id)
         elif isinstance(record, SoftmaxForwardRecord):
             retained.add(record.output_node_id)
@@ -295,6 +305,7 @@ def _graph_requires_primal_backward_grad(records: Sequence[ForwardRecord]) -> bo
             record,
             (
                 LayerNormForwardRecord,
+                FunctionalLayerNormForwardRecord,
                 RMSNormForwardRecord,
                 GELUForwardRecord,
                 UnaryElementwiseForwardRecord,
@@ -313,7 +324,15 @@ def _record_has_backward_nonlinearity_tangents(
     record: ForwardRecord,
     forward_tangents_by_node: Mapping[int, Mapping[nn.Parameter, torch.Tensor]],
 ) -> bool:
-    if isinstance(record, (GELUForwardRecord, LayerNormForwardRecord, RMSNormForwardRecord)):
+    if isinstance(
+        record,
+        (
+            GELUForwardRecord,
+            LayerNormForwardRecord,
+            FunctionalLayerNormForwardRecord,
+            RMSNormForwardRecord,
+        ),
+    ):
         return bool(forward_tangents_by_node.get(record.input_node_id))
     if isinstance(record, SoftmaxForwardRecord):
         return bool(forward_tangents_by_node.get(record.output_node_id))

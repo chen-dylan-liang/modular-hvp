@@ -82,6 +82,13 @@ class DualTensor(torch.Tensor):
             kwargs = {}
         if _has_out_argument(kwargs):
             raise NotImplementedError(f"DualTensor rule not implemented for {func}")
+        rule = _RULES.get(func)
+        if rule is not None:
+            token = _OUTER_GRAD_ENABLED.set(torch.is_grad_enabled())
+            try:
+                return rule(func, args, kwargs)
+            finally:
+                _OUTER_GRAD_ENABLED.reset(token)
         if not _IN_TANGENT_EVAL.get() and _tree_has_dual((args, kwargs)):
             with torch._C.DisableTorchFunctionSubclass():
                 primal_output = func(*_tree_primal(args), **_tree_primal(kwargs))
@@ -96,9 +103,6 @@ class DualTensor(torch.Tensor):
 
         token = _OUTER_GRAD_ENABLED.set(torch.is_grad_enabled())
         try:
-            rule = _RULES.get(func)
-            if rule is not None:
-                return rule(func, args, kwargs)
             with torch._C.DisableTorchFunctionSubclass():
                 return func(*args, **kwargs)
         finally:
@@ -1582,6 +1586,52 @@ def _where_tangent(func: Any, condition: Any, left: Any, right: Any) -> Any:
     return func(condition, left, right)
 
 
+def _masked_fill_rule(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> DualTensor:
+    input_value, mask, fill_value = args[:3]
+    if is_dual(mask):
+        raise NotImplementedError("DualTensor rule not implemented for dual masks")
+    input_p, input_t, input_is_dual = _split(input_value)
+    fill_p, fill_t, fill_is_dual = _split(fill_value)
+    primal_output = _call_primal(func, input_p, mask, fill_p, **kwargs)
+    with torch.no_grad():
+        mask_ng = mask.detach() if isinstance(mask, torch.Tensor) else mask
+        input_tangent = (
+            input_t if input_is_dual else torch.zeros_like(primal_output.detach())
+        )
+        fill_tangent = (
+            fill_t if fill_is_dual else torch.zeros_like(primal_output.detach())
+        )
+        tangent_output = torch.where(mask_ng, fill_tangent, input_tangent)
+    return _make_rule_output(primal_output, tangent_output)
+
+
+def _native_dropout_rule(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[DualTensor, torch.Tensor]:
+    input_value, p, train = args[:3]
+    input_p, input_t, input_is_dual = _split(input_value)
+    primal_output, mask = _call_primal(func, input_p, p, train, **kwargs)
+    with torch.no_grad():
+        if not input_is_dual:
+            tangent_output = torch.zeros_like(primal_output.detach())
+        elif not train or p == 0.0:
+            tangent_output = input_t
+        else:
+            scale = 1.0 / (1.0 - float(p))
+            tangent_output = torch.where(
+                mask.detach(),
+                input_t * scale,
+                torch.zeros_like(input_t),
+            )
+    return _make_rule_output(primal_output, tangent_output), mask
+
+
 def _attention_and_score_tangent(
     query: torch.Tensor,
     query_tangent: torch.Tensor | None,
@@ -1736,6 +1786,9 @@ _register("native_layer_norm", "default", _native_layer_norm_rule)
 _register("embedding", "default", _embedding_rule)
 _register("mse_loss", "default", _mse_loss_rule)
 _register("mse_loss_backward", "default", _mse_loss_backward_rule)
+_register("masked_fill", "Scalar", _masked_fill_rule)
+_register("masked_fill", "Tensor", _masked_fill_rule)
+_register("native_dropout", "default", _native_dropout_rule)
 
 for _name in ("gt", "ge", "lt", "le", "eq", "ne"):
     _register(_name, "Tensor", _comparison_rule)
