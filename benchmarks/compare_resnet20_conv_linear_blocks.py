@@ -12,7 +12,7 @@ import time
 import tracemalloc
 import traceback
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any
@@ -251,7 +251,8 @@ def _child_method_benchmark(
     try:
         spec = _methods()[name]
         for index in range(iterations):
-            model, loss_fn, x, target, vectors = make_problem(config)
+            iteration_config = replace(config, seed=config.seed + index)
+            model, loss_fn, x, target, vectors = make_problem(iteration_config)
             if config.device.startswith("cuda"):
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
@@ -366,6 +367,10 @@ def main() -> None:
         | {
             "warmup": args.warmup,
             "repeats": args.repeats,
+            "repeat_seeds": [
+                config.seed + index
+                for index in range(args.warmup, args.warmup + args.repeats)
+            ],
             "rss_sample_interval_ms": args.rss_sample_interval_ms,
         },
         "block_partition": "Conv2d/Linear direct parameters grouped; all others singleton",

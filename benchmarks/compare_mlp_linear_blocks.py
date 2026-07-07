@@ -12,7 +12,7 @@ import time
 import tracemalloc
 import traceback
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any
@@ -240,7 +240,8 @@ def _child_method_benchmark(
             from backpack.hessianfree import hvp as _hvp  # noqa: F401
 
         for index in range(iterations):
-            model, loss_fn, x, target, vectors = make_problem(config)
+            iteration_config = replace(config, seed=config.seed + index)
+            model, loss_fn, x, target, vectors = make_problem(iteration_config)
             if config.device.startswith("cuda"):
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
@@ -394,6 +395,10 @@ def main() -> None:
             "device": args.device,
             "warmup": args.warmup,
             "repeats": args.repeats,
+            "repeat_seeds": [
+                args.seed + index
+                for index in range(args.warmup, args.warmup + args.repeats)
+            ],
             "rss_sample_interval_ms": args.rss_sample_interval_ms,
         },
         "comparisons": comparisons_by_depth,

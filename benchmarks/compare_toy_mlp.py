@@ -12,7 +12,7 @@ import time
 import tracemalloc
 import traceback
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from multiprocessing.connection import Connection
 
 import psutil
@@ -359,7 +359,8 @@ def _child_method_benchmark(
     try:
         spec = _methods()[name]
         for index in range(iterations):
-            model, loss_fn, x, target, vectors = spec.make_problem(config)
+            iteration_config = replace(config, seed=config.seed + index)
+            model, loss_fn, x, target, vectors = spec.make_problem(iteration_config)
             if config.device.startswith("cuda"):
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
@@ -631,7 +632,15 @@ def main() -> None:
         print(
             json.dumps(
                 {
-                    "config": asdict(config),
+                    "config": asdict(config)
+                    | {
+                        "warmup": args.warmup,
+                        "repeats": args.repeats,
+                        "repeat_seeds": [
+                            config.seed + index
+                            for index in range(args.warmup, args.warmup + args.repeats)
+                        ],
+                    },
                     "comparisons": comparisons,
                     "stats": [asdict(item) for item in stats],
                 },
