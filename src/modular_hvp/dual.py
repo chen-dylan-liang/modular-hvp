@@ -1000,8 +1000,13 @@ def _cudnn_batch_norm_rule(
         )
         reserve = torch.empty(0, dtype=torch.uint8, device=input_p.device)
     else:
-        primal_output, save_mean, save_invstd, reserve = _call_primal(
-            func,
+        del func
+        # Build the primal autograd graph through native BatchNorm. Returning
+        # wrapper save tensors from the cuDNN op can violate cuDNN's internal
+        # backward save-tensor checks, while native BatchNorm exposes the same
+        # differentiable output and saved mean/invstd values needed here.
+        primal_output, save_mean, save_invstd = _call_primal(
+            torch.ops.aten.native_batch_norm.default,
             input_p,
             weight_p,
             bias_p,
@@ -1012,6 +1017,7 @@ def _cudnn_batch_norm_rule(
             eps,
             **kwargs,
         )
+        reserve = torch.empty(0, dtype=torch.uint8, device=input_p.device)
 
     with torch.no_grad():
         tangent_output, save_mean_tangent, save_invstd_tangent = _batch_norm_tangent(
