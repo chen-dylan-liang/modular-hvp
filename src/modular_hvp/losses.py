@@ -74,7 +74,7 @@ def _make_loss_output_curvature(
             value = value.to(dtype=logits.dtype)
             if not value.is_contiguous():
                 value = value.contiguous()
-            weighted = torch.linalg.vecdot(probabilities, value, dim=-1).unsqueeze(-1)
+            weighted = (probabilities * value).sum(dim=-1, keepdim=True)
             value.sub_(weighted)
             value.mul_(probabilities)
             value.masked_fill_(~valid.unsqueeze(-1), 0)
