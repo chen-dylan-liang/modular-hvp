@@ -9,7 +9,8 @@ from torch import nn
 from torch.nn import functional as F
 
 import modular_hvp.eager as eager_runtime
-from modular_hvp import FakeDualBackend, LocalDualActivations, is_dual, modular_hvp
+from modular_hvp import is_dual, modular_hvp
+from modular_hvp.backend import FakeDualBackend, LocalDualActivations
 
 
 class ToyBasicBlock(nn.Module):
@@ -163,6 +164,64 @@ class TinyNanoChatPattern(nn.Module):
         x = torch.relu(x).square()
         logits = self.proj(x).float()
         logits = torch.tanh(logits / 5.0) * 5.0
+        return F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
+        )
+
+
+class TinyNanoChatQKVAttention(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int = 13,
+        block_size: int = 5,
+        d_model: int = 8,
+        n_heads: int = 2,
+    ) -> None:
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.wte = nn.Embedding(vocab_size, d_model)
+        self.wpe = nn.Embedding(block_size, d_model)
+        self.ln = nn.LayerNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.head = nn.Linear(d_model, vocab_size)
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.register_buffer(
+            "causal_mask",
+            torch.tril(torch.ones(block_size, block_size, dtype=torch.bool)).view(
+                1,
+                1,
+                block_size,
+                block_size,
+            ),
+        )
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        batch, tokens = idx.shape
+        pos = torch.arange(tokens, device=idx.device)
+        x = self.wte(idx) + self.wpe(pos)
+        h = self.ln(x)
+        q = self.q_proj(h)
+        k = self.k_proj(h)
+        v = self.v_proj(h)
+        q = q.view(batch, tokens, self.n_heads, self.d_head).transpose(1, 2)
+        k = k.view(batch, tokens, self.n_heads, self.d_head).transpose(1, 2)
+        v = v.view(batch, tokens, self.n_heads, self.d_head).transpose(1, 2)
+        scores = (q @ k.transpose(-2, -1)) / (self.d_head**0.5)
+        scores = scores.masked_fill(
+            ~self.causal_mask[:, :, :tokens, :tokens],
+            float("-inf"),
+        )
+        attention = torch.softmax(scores, dim=-1)
+        y = (attention @ v).transpose(1, 2).contiguous()
+        y = y.view(batch, tokens, self.n_heads * self.d_head)
+        x = x + self.out_proj(y)
+        logits = self.head(x)
         return F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
@@ -430,6 +489,39 @@ def _custom_block_autodiff_hvps(
     return hvps
 
 
+def _custom_block_autodiff_hvps_from_loss(
+    loss: torch.Tensor,
+    model: nn.Module,
+    tangents: Mapping[str, torch.Tensor],
+    blocks: Mapping[Any, Sequence[str]],
+) -> dict[str, torch.Tensor]:
+    named_parameters = dict(model.named_parameters())
+    hvps: dict[str, torch.Tensor] = {}
+    for block_names in blocks.values():
+        block_parameters = [named_parameters[name] for name in block_names]
+        block_tangents = [tangents[name] for name in block_names]
+        gradients = torch.autograd.grad(
+            loss,
+            block_parameters,
+            create_graph=True,
+            retain_graph=True,
+            materialize_grads=True,
+        )
+        directional_gradient = sum(
+            (gradient * tangent_value).sum()
+            for gradient, tangent_value in zip(gradients, block_tangents, strict=True)
+        )
+        block_hvps = torch.autograd.grad(
+            directional_gradient,
+            block_parameters,
+            retain_graph=True,
+            materialize_grads=True,
+        )
+        for name, hvp in zip(block_names, block_hvps, strict=True):
+            hvps[name] = hvp.detach()
+    return hvps
+
+
 def _finite_difference_block_hvps(
     model: nn.Module,
     loss_fn: nn.Module,
@@ -600,6 +692,43 @@ def test_modular_hvp_supports_linear_module_blocks_on_sequential_mlp() -> None:
         assert torch.allclose(parameter.hvp, reference_hvps[name], rtol=1e-10, atol=1e-10)
 
 
+def test_custom_blocks_may_leave_parameters_as_singletons() -> None:
+    torch.manual_seed(44)
+    baseline = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2)).double()
+    model = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2)).double()
+    model.load_state_dict(baseline.state_dict())
+
+    x = torch.randn(5, 3, dtype=torch.float64)
+    target = torch.randn(5, 2, dtype=torch.float64)
+    criterion = nn.MSELoss()
+    tangents = {
+        name: torch.randn_like(parameter)
+        for name, parameter in model.named_parameters()
+    }
+    blocks = {model[0]: ("0.weight", "0.bias")}
+    baseline_blocks = {
+        baseline[0]: ("0.weight", "0.bias"),
+        "2.weight": ("2.weight",),
+        "2.bias": ("2.bias",),
+    }
+
+    reference_hvps = _custom_block_autodiff_hvps(
+        baseline,
+        criterion,
+        x,
+        target,
+        tangents,
+        baseline_blocks,
+    )
+    with modular_hvp(model, tangents, blocks=blocks):
+        loss = criterion(model(x), target)
+        loss.backward()
+
+    for name, parameter in model.named_parameters():
+        assert parameter.hvp is not None
+        assert torch.allclose(parameter.hvp, reference_hvps[name], rtol=1e-10, atol=1e-10)
+
+
 def test_linear_module_blocks_keep_within_module_cross_terms() -> None:
     torch.manual_seed(43)
     baseline = nn.Sequential(nn.Linear(2, 2), nn.ReLU(), nn.Linear(2, 1)).double()
@@ -678,6 +807,66 @@ def test_modular_hvp_supports_full_block_on_sequential_mlp() -> None:
     for name, parameter in model.named_parameters():
         assert parameter.hvp is not None
         assert torch.allclose(parameter.hvp, reference_hvps[name], rtol=1e-10, atol=1e-10)
+
+
+def test_custom_block_rejects_disconnected_parameter_dependency_graph() -> None:
+    torch.manual_seed(45)
+    model = nn.Sequential(
+        nn.Linear(3, 4),
+        nn.ReLU(),
+        nn.Linear(4, 4),
+        nn.ReLU(),
+        nn.Linear(4, 2),
+    ).double()
+
+    x = torch.randn(5, 3, dtype=torch.float64)
+    target = torch.randn(5, 2, dtype=torch.float64)
+    criterion = nn.MSELoss()
+    tangents = {
+        name: torch.randn_like(parameter)
+        for name, parameter in model.named_parameters()
+    }
+    blocks = {
+        "disconnected": ("0.weight", "4.weight"),
+        "0.bias": ("0.bias",),
+        "2.weight": ("2.weight",),
+        "2.bias": ("2.bias",),
+        "4.bias": ("4.bias",),
+    }
+
+    with pytest.raises(NotImplementedError, match="disconnected"):
+        with modular_hvp(model, tangents, blocks=blocks):
+            loss = criterion(model(x), target)
+            loss.backward()
+
+
+def test_custom_block_rejects_unsupported_multi_leaf_parameterized_op() -> None:
+    torch.manual_seed(46)
+    model = nn.Sequential(
+        nn.Conv2d(1, 2, kernel_size=3, padding=1),
+        nn.ReLU(),
+        nn.Conv2d(2, 2, kernel_size=3, padding=1),
+        nn.Flatten(),
+        nn.Linear(2 * 4 * 4, 3),
+    ).double()
+
+    x = torch.randn(2, 1, 4, 4, dtype=torch.float64)
+    target = torch.randn(2, 3, dtype=torch.float64)
+    criterion = nn.MSELoss()
+    tangents = {
+        name: torch.randn_like(parameter)
+        for name, parameter in model.named_parameters()
+    }
+    blocks = {
+        "conv_pair": ("0.weight", "0.bias", "2.weight", "2.bias"),
+        "linear_weight": ("4.weight",),
+        "linear_bias": ("4.bias",),
+    }
+
+    with pytest.raises(NotImplementedError, match="backward-input JVP"):
+        with modular_hvp(model, tangents, blocks=blocks):
+            loss = criterion(model(x), target)
+            loss.backward()
 
 
 def test_default_modular_hvp_matches_block_autodiff_on_sequential_cnn() -> None:
@@ -903,6 +1092,59 @@ def test_default_modular_hvp_matches_block_autodiff_on_token_gpt_pattern() -> No
             reference_hvps[name],
             rtol=1e-5,
             atol=1e-6,
+        )
+
+
+def test_custom_qkv_block_on_nanochat_shaped_attention_matches_grouped_autodiff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(47)
+    baseline = TinyNanoChatQKVAttention().double()
+    model = TinyNanoChatQKVAttention().double()
+    model.load_state_dict(baseline.state_dict())
+
+    idx = torch.randint(0, 13, (2, 5), dtype=torch.long)
+    targets = torch.randint(0, 13, (2, 5), dtype=torch.long)
+    targets[0, -1] = -1
+    tangents = {
+        name: torch.randn_like(parameter)
+        for name, parameter in model.named_parameters()
+    }
+    qkv_names = (
+        "q_proj.weight",
+        "q_proj.bias",
+        "k_proj.weight",
+        "k_proj.bias",
+        "v_proj.weight",
+        "v_proj.bias",
+    )
+    blocks: dict[str, tuple[str, ...]] = {"qkv": qkv_names}
+    for name in tangents:
+        if name not in qkv_names:
+            blocks[name] = (name,)
+
+    reference_hvps = _custom_block_autodiff_hvps_from_loss(
+        baseline(idx, targets),
+        baseline,
+        tangents,
+        blocks,
+    )
+
+    def fail_autograd_grad(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("modular_hvp must not use reverse-over-reverse fallback")
+
+    monkeypatch.setattr(torch.autograd, "grad", fail_autograd_grad)
+    with modular_hvp(model, tangents, blocks=blocks):
+        loss = model(idx, targets)
+        loss.backward()
+
+    for name, parameter in model.named_parameters():
+        assert parameter.hvp is not None
+        torch.testing.assert_close(
+            parameter.hvp,
+            reference_hvps[name],
+            rtol=1e-8,
+            atol=1e-9,
         )
 
 

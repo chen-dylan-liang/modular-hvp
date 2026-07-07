@@ -24,6 +24,7 @@ from modular_hvp.records import (
     _record_input_node_ids,
     _record_local_output_tangents,
     _record_output_node_id,
+    _release_record_saved_tensors,
 )
 
 
@@ -46,6 +47,7 @@ class RecordedForwardGraph:
         records: Sequence[ForwardRecord],
         output_node_id: int,
         retain_local_parameter_inputs: bool = False,
+        extra_retained_forward_tangent_node_ids: set[int] | frozenset[int] | None = None,
     ) -> "RecordedForwardGraph":
         records_tuple = tuple(records)
         return cls(
@@ -61,6 +63,7 @@ class RecordedForwardGraph:
                     records_tuple,
                     output_node_id,
                     retain_local_parameter_inputs=retain_local_parameter_inputs,
+                    extra_retained_node_ids=extra_retained_forward_tangent_node_ids,
                 )
             ),
             requires_hooked_primal_grads=_graph_requires_primal_backward_grad(
@@ -95,6 +98,7 @@ class GraphTraversalState:
     remaining_local_uses_by_parameter: dict[nn.Parameter, int] = field(
         default_factory=dict
     )
+    primal_grad_required_output_node_ids: set[int] = field(default_factory=set)
 
     def clear(self) -> None:
         self.forward_tangents_by_node.clear()
@@ -105,6 +109,7 @@ class GraphTraversalState:
         self.ready_output_node_ids.clear()
         self.local_parameters_by_output_node.clear()
         self.remaining_local_uses_by_parameter.clear()
+        self.primal_grad_required_output_node_ids.clear()
 
     def prepare_hooked_backward(
         self,
@@ -118,6 +123,7 @@ class GraphTraversalState:
         local_parameters_by_output_node: dict[int, tuple[nn.Parameter, ...]],
         remaining_local_uses_by_parameter: dict[nn.Parameter, int],
         input_use_counts: dict[int, int],
+        primal_grad_required_output_node_ids: set[int],
     ) -> None:
         self.clear()
         self.forward_tangents_by_node = retained_forward_tangents_by_node
@@ -125,6 +131,8 @@ class GraphTraversalState:
         self.local_parameters_by_output_node = local_parameters_by_output_node
         self.remaining_local_uses_by_parameter = remaining_local_uses_by_parameter
         self.pending_consumers_by_node = input_use_counts
+        self.primal_grad_required_output_node_ids = primal_grad_required_output_node_ids
+        self._queue_if_ready_by_node(graph=None, output_node_id=output_node_id)
 
     def observe_primal_grad(
         self,
@@ -133,6 +141,8 @@ class GraphTraversalState:
         grad: torch.Tensor,
     ) -> None:
         output_node_id = _record_output_node_id(record)
+        if output_node_id in self.processed_output_node_ids:
+            return
         self.primal_grads_by_node[output_node_id] = grad.detach()
         self._queue_if_ready(graph, output_node_id)
 
@@ -140,7 +150,10 @@ class GraphTraversalState:
         output_node_id = _record_output_node_id(record)
         return (
             output_node_id not in self.processed_output_node_ids
-            and output_node_id in self.primal_grads_by_node
+            and (
+                output_node_id not in self.primal_grad_required_output_node_ids
+                or output_node_id in self.primal_grads_by_node
+            )
             and self.pending_consumers_by_node.get(output_node_id, 0) == 0
         )
 
@@ -163,6 +176,12 @@ class GraphTraversalState:
 
     def primal_grad(self, record: ForwardRecord) -> torch.Tensor:
         return self.primal_grads_by_node[_record_output_node_id(record)]
+
+    def requires_primal_grad(self, record: ForwardRecord) -> bool:
+        return (
+            _record_output_node_id(record)
+            in self.primal_grad_required_output_node_ids
+        )
 
     def local_parameters_for(self, record: ForwardRecord) -> tuple[nn.Parameter, ...]:
         output_node_id = _record_output_node_id(record)
@@ -187,8 +206,10 @@ class GraphTraversalState:
     ) -> None:
         output_node_id = _record_output_node_id(record)
         self.processed_output_node_ids.add(output_node_id)
+        self.primal_grads_by_node.pop(output_node_id, None)
         self.forward_tangents_by_node.pop(output_node_id, None)
         self.local_parameters_by_output_node.pop(output_node_id, None)
+        _release_record_saved_tensors(record)
         for input_node_id in _record_input_node_ids(record):
             remaining = self.pending_consumers_by_node.get(input_node_id)
             if remaining is None:
@@ -211,6 +232,21 @@ class GraphTraversalState:
         if record is not None and self.is_ready(record):
             self.ready_output_node_ids.append(output_node_id)
 
+    def _queue_if_ready_by_node(
+        self,
+        graph: RecordedForwardGraph | None,
+        output_node_id: int,
+    ) -> None:
+        if graph is None:
+            if (
+                output_node_id
+                not in self.primal_grad_required_output_node_ids
+                and self.pending_consumers_by_node.get(output_node_id, 0) == 0
+            ):
+                self.ready_output_node_ids.append(output_node_id)
+            return
+        self._queue_if_ready(graph, output_node_id)
+
 
 def _take_graph_local_parameters_by_output_node(
     records: Sequence[ForwardRecord],
@@ -223,16 +259,6 @@ def _take_graph_local_parameters_by_output_node(
         local_parameters_by_node[_record_output_node_id(record)] = tuple(local_tangents)
         local_tangents.clear()
     return local_parameters_by_node
-
-
-def _local_parameter_use_counts(
-    local_parameters_by_output_node: Mapping[int, tuple[nn.Parameter, ...]],
-) -> dict[nn.Parameter, int]:
-    counts: dict[nn.Parameter, int] = {}
-    for parameters in local_parameters_by_output_node.values():
-        for parameter in parameters:
-            counts[parameter] = counts.get(parameter, 0) + 1
-    return counts
 
 
 def _graph_input_use_counts(records: Sequence[ForwardRecord]) -> dict[int, int]:
@@ -248,8 +274,11 @@ def _graph_forward_tangent_retained_node_ids(
     output_node_id: int,
     *,
     retain_local_parameter_inputs: bool,
+    extra_retained_node_ids: set[int] | frozenset[int] | None,
 ) -> set[int]:
     retained = {output_node_id}
+    if extra_retained_node_ids:
+        retained.update(extra_retained_node_ids)
     for record in records:
         if retain_local_parameter_inputs and _record_local_output_tangents(record):
             retained.update(_record_input_node_ids(record))
@@ -311,11 +340,11 @@ def _graph_requires_primal_backward_grad(records: Sequence[ForwardRecord]) -> bo
                 UnaryElementwiseForwardRecord,
                 MatmulForwardRecord,
                 MulForwardRecord,
-                DivForwardRecord,
                 SoftmaxForwardRecord,
                 ScaledDotProductAttentionForwardRecord,
             ),
         )
+        or (isinstance(record, DivForwardRecord) and record.right_node_id is not None)
         for record in records
     )
 

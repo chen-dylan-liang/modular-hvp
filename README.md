@@ -26,13 +26,15 @@ Current implementation status:
   `Conv2d`, eval-mode `BatchNorm2d`, `LayerNorm`, `ReLU`, `GELU`, eval-mode
   `Dropout`, `Flatten`, `AvgPool2d`, `AdaptiveAvgPool2d`, `MaxPool2d`, and
   limited `MultiheadAttention`.
-- The eager runtime also accepts an optional `blocks=` partition for the first
-  module-wise milestone. Grouped parameters may belong to one supported leaf
-  module in a sequential model, for example a `Linear` module's `weight` and
-  `bias`. Contiguous multi-`Linear` blocks in sequential MLPs are also
-  supported, including the full-MLP block. Each grouped block shares one local
-  epsilon, so within-block Hessian cross terms are retained while cross-block
-  terms are still ignored.
+- The eager runtime also accepts optional `blocks=` entries for the module-wise
+  milestone. Grouped parameters may belong to one supported leaf module, for
+  example a `Linear` module's `weight` and `bias`. Parameters omitted from
+  `blocks` remain singleton blocks. Multi-leaf blocks are validated after
+  forward on the recorded parameterized dependency graph: each explicit block
+  must induce a connected subgraph, and same-block upstream edges may only
+  enter parameterized ops whose local backward-input JVP is implemented. This
+  currently covers multi-Linear MLP blocks, including the full-MLP block, and
+  rejects unsupported connected blocks with a clear error.
 - The primitive `DualTensor` backend implements the operator-overloading layer
   used by lower-level forward-mode tests and by the current local backward
   tensor programs.
@@ -101,17 +103,32 @@ with modular_hvp(model, v, blocks=blocks):
     loss.backward()
 ```
 
-Every trainable parameter must appear in exactly one block. Parameters in the
-same block share one local epsilon, so for block `B` the public values are:
+Parameters listed in the same block share one local epsilon. Parameters omitted
+from `blocks` are treated as singleton blocks, so users only need to specify
+the groups they want to enlarge. HVP access remains per parameter, not per
+module:
+
+```python
+for name, p in model.named_parameters():
+    p.hvp
+```
+
+For block `B`, the public per-parameter values are:
 
 ```text
 p.hvp = sum_{q in B} H[p, q] v_q
 ```
 
-The current implementation intentionally rejects multi-leaf custom blocks
-outside contiguous sequential Linear MLP spans. DAG-aware custom block
-validation is the next graph-scoping step; the primitive `DualTensor` backend
-does not need to change for that work.
+For multi-leaf blocks, validation runs on a compressed parameterized dependency
+graph built from the recorded forward graph. Nodes are parameterized use sites;
+non-parameter tensor operations form dependency edges and fan-in joins. Each
+custom block must be connected in this graph. Blocks that would require a
+missing local backward-input JVP, for example a sequential Conv2d-to-Conv2d
+block, are rejected until that primitive backward-side rule is added.
+The regression suite covers both a full sequential MLP block and a
+nanochat-shaped attention block that groups separate `q_proj`, `k_proj`, and
+`v_proj` parameters while leaving the output projection and other parameters as
+separate blocks.
 
 ## Runtime Structure
 
@@ -173,6 +190,17 @@ accumulates into the single public `p.hvp`, propagates any remaining tangent
 packet to its input nodes, and releases retained state for that output node.
 The hooked DAG path uses a ready stack keyed by output node id, so it no longer
 rescans the full reverse record list every time a tensor hook fires.
+
+The current graph runtime also prunes runtime-owned memory lifetimes:
+
+- saved autograd tensor references are released as soon as their forward record
+  drains in the reverse traversal;
+- graph bookkeeping maps, retained tangent packets, and raw parameter source
+  maps are cleared immediately after HVPs have been written;
+- the sequential fast path no longer stores records in the graph record list
+  because autograd hook closures already own the records they need;
+- saved-tensor fallbacks are kept only when PyTorch's autograd saved tensors
+  cannot be resolved.
 
 Sequential models are optimized as a chain special case, but the generic
 contract is graph-based. New architectures should usually require only new
@@ -385,14 +413,14 @@ mutated independently during traversal.
 
 | Hidden Linear/ReLU blocks | Method | Max abs error vs grouped RoR | Max rel error vs grouped RoR | Mean time | Time vs `modular_linear_blocks` | Median peak RSS | Peak RSS vs `modular_linear_blocks` |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 4 | `modular_per_parameter` | 2.230e-01 | 1.361e+00 | 17.089 ms | 1.05x | 177.04 MiB | 1.00x |
-| 4 | `modular_linear_blocks` | 1.863e-09 | 4.091e-07 | 16.284 ms | 1.00x | 176.47 MiB | 1.00x |
-| 4 | `backpack_autodiff_linear_blocks` | 0.000e+00 | 0.000e+00 | 17.082 ms | 1.05x | 229.12 MiB | 1.30x |
-| 4 | `torch_backward` | n/a | n/a | 2.417 ms | 0.15x | 171.74 MiB | 0.97x |
-| 50 | `modular_per_parameter` | 3.155e-01 | 1.143e+00 | 2127.611 ms | 1.85x | 257.64 MiB | 1.00x |
-| 50 | `modular_linear_blocks` | 9.686e-08 | 1.387e-06 | 1149.908 ms | 1.00x | 257.39 MiB | 1.00x |
-| 50 | `backpack_autodiff_linear_blocks` | 0.000e+00 | 0.000e+00 | 2251.654 ms | 1.96x | 324.59 MiB | 1.26x |
-| 50 | `torch_backward` | n/a | n/a | 27.991 ms | 0.02x | 206.99 MiB | 0.80x |
+| 4 | `modular_per_parameter` | 2.230e-01 | 1.361e+00 | 17.482 ms | 1.01x | 177.18 MiB | 1.00x |
+| 4 | `modular_linear_blocks` | 1.863e-09 | 4.091e-07 | 17.301 ms | 1.00x | 176.49 MiB | 1.00x |
+| 4 | `backpack_autodiff_linear_blocks` | 0.000e+00 | 0.000e+00 | 16.003 ms | 0.92x | 229.32 MiB | 1.30x |
+| 4 | `torch_backward` | n/a | n/a | 2.477 ms | 0.14x | 172.25 MiB | 0.98x |
+| 50 | `modular_per_parameter` | 3.155e-01 | 1.143e+00 | 2271.282 ms | 1.91x | 257.64 MiB | 1.00x |
+| 50 | `modular_linear_blocks` | 9.686e-08 | 1.387e-06 | 1190.263 ms | 1.00x | 257.54 MiB | 1.00x |
+| 50 | `backpack_autodiff_linear_blocks` | 0.000e+00 | 0.000e+00 | 2211.970 ms | 1.86x | 325.03 MiB | 1.26x |
+| 50 | `torch_backward` | n/a | n/a | 27.481 ms | 0.02x | 207.04 MiB | 0.80x |
 
 ### Full-MLP HVP Comparison
 
@@ -427,14 +455,14 @@ competitive or faster on this CPU run.
 
 | Hidden Linear/ReLU blocks | Method | Max abs error vs full RoR | Max rel error vs full RoR | Mean time | Time vs `modular_full` | Median peak RSS | Peak RSS vs `modular_full` |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 4 | `modular_full` | 1.490e-08 | 2.676e-07 | 21.178 ms | 1.00x | 192.04 MiB | 1.00x |
-| 4 | `backpack_autodiff_full` | 0.000e+00 | 0.000e+00 | 16.130 ms | 0.76x | 232.92 MiB | 1.21x |
-| 4 | `torch_func_jvp_full` | 3.725e-08 | 3.568e-07 | 24.044 ms | 1.14x | 249.98 MiB | 1.30x |
-| 4 | `torch_backward` | n/a | n/a | 4.079 ms | 0.19x | 171.84 MiB | 0.89x |
-| 50 | `modular_full` | 1.118e-08 | 1.090e-06 | 271.466 ms | 1.00x | 390.67 MiB | 1.00x |
-| 50 | `backpack_autodiff_full` | 0.000e+00 | 0.000e+00 | 228.550 ms | 0.84x | 375.58 MiB | 0.96x |
-| 50 | `torch_func_jvp_full` | 2.235e-08 | 1.048e-06 | 165.997 ms | 0.61x | 346.02 MiB | 0.89x |
-| 50 | `torch_backward` | n/a | n/a | 37.370 ms | 0.14x | 206.95 MiB | 0.53x |
+| 4 | `modular_full` | 1.490e-08 | 2.676e-07 | 21.769 ms | 1.00x | 189.98 MiB | 1.00x |
+| 4 | `backpack_autodiff_full` | 0.000e+00 | 0.000e+00 | 18.297 ms | 0.84x | 232.76 MiB | 1.23x |
+| 4 | `torch_func_jvp_full` | 3.725e-08 | 3.568e-07 | 17.649 ms | 0.81x | 250.38 MiB | 1.32x |
+| 4 | `torch_backward` | n/a | n/a | 3.205 ms | 0.15x | 172.00 MiB | 0.91x |
+| 50 | `modular_full` | 1.118e-08 | 1.090e-06 | 196.508 ms | 1.00x | 365.68 MiB | 1.00x |
+| 50 | `backpack_autodiff_full` | 0.000e+00 | 0.000e+00 | 180.660 ms | 0.92x | 376.25 MiB | 1.03x |
+| 50 | `torch_func_jvp_full` | 2.235e-08 | 1.048e-06 | 116.414 ms | 0.59x | 347.11 MiB | 0.95x |
+| 50 | `torch_backward` | n/a | n/a | 26.629 ms | 0.14x | 207.26 MiB | 0.57x |
 
 ## Toy CNN Comparison
 
@@ -509,10 +537,10 @@ Observed result:
 
 | Method | Max abs error | Max rel error | Mean time | Time vs `modular_hvp` | Median peak RSS | Peak RSS vs `modular_hvp` |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `modular_hvp` | 0.000e+00 | 0.000e+00 | 402.629 ms | 1.00x | 176.46 MiB | 1.00x |
+| `modular_hvp` | 0.000e+00 | 0.000e+00 | 396.013 ms | 1.00x | 176.84 MiB | 1.00x |
 | `backpack_hmp` | unsupported | unsupported | unsupported | n/a | n/a | n/a |
-| `backpack_autodiff` | 1.490e-08 | 8.160e-07 | 753.163 ms | 1.87x | 237.53 MiB | 1.35x |
-| `torch_backward` | n/a | n/a | 11.208 ms | 0.03x | 172.73 MiB | 0.98x |
+| `backpack_autodiff` | 1.490e-08 | 8.160e-07 | 1033.705 ms | 2.61x | 236.91 MiB | 1.34x |
+| `torch_backward` | n/a | n/a | 16.461 ms | 0.04x | 173.22 MiB | 0.98x |
 
 BackPACK HMP is unsupported on this residual graph in the installed BackPACK
 version: after `extend(..., use_converter=True)`, HMP fails on BackPACK's
@@ -522,7 +550,41 @@ Performance note: the DAG path avoids the earlier correctness bug at residual
 joins by propagating graph-indexed tangent packets in one backward pass. It is
 still slower than the single-chain path because graph joins and nonlinear
 backward JVPs need packet bookkeeping, but it no longer replays a downstream
-graph action per parameter.
+graph action per parameter. For single-pass DAG graphs, reverse packet
+propagation is pruned by forward channel reachability: a block channel is sent
+into an upstream branch only if that branch actually contains the channel's
+local forward tangent. This removes redundant work at residual joins while
+preserving locality.
+
+### ResNet20 Conv/Linear Block Comparison
+
+The custom-block ResNet20 benchmark groups direct parameters of each `Conv2d`
+and `Linear` module into one block. BatchNorm parameters remain singleton
+blocks, so the partition still covers every trainable parameter without adding
+a BatchNorm module-block claim to this run:
+
+```bash
+uv run python benchmarks/compare_resnet20_conv_linear_blocks.py \
+  --batch-size 2 --image-size 8 --width 2 --d-out 3 \
+  --dtype float32 --warmup 1 --repeats 3
+```
+
+The RoR baseline uses the same block partition and runs one
+reverse-over-reverse HVP per block.
+
+| Method | Max abs error vs grouped RoR | Max rel error vs grouped RoR | Mean time | Time vs `modular_conv_linear` | Median peak RSS | Peak RSS vs `modular_conv_linear` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `modular_conv_linear` | 2.980e-08 | 6.904e-07 | 299.698 ms | 1.00x | 176.40 MiB | 1.00x |
+| `ror_conv_linear` | 0.000e+00 | 0.000e+00 | 404.921 ms | 1.35x | 177.07 MiB | 1.00x |
+| `torch_backward` | n/a | n/a | 11.566 ms | 0.04x | 172.83 MiB | 0.98x |
+
+On this small CPU ResNet20 grouped-partition run, ModularHVP is faster than
+grouped RoR. The reachability pruning matters here because residual additions
+otherwise send each block channel into both branches, including branches that
+cannot contain that channel's local parameter source. Conv/Linear `weight` and
+`bias` blocks also stay on the single-pass graph traversal because they do not
+cross a parameterized input boundary; only blocks with same-block upstream
+parameterized dependencies need the hooked graph traversal.
 
 ## Transformer / Multihead Attention Support
 
@@ -602,6 +664,47 @@ BackPACK baseline limitations observed on this toy Transformer:
   process RSS in this run.
 - BackPACK autodiff cannot run the fused flash-attention path because the
   required second derivative is unavailable.
+
+### QKV Block Comparison
+
+The qkv grouping benchmark uses a nanochat-shaped attention fixture with
+separate `q_proj`, `k_proj`, and `v_proj` modules. It groups all q/k/v weights
+and biases into one block, while every other trainable parameter remains a
+singleton block:
+
+```bash
+uv run python benchmarks/compare_qkv_grouping.py \
+  --batch-size 2 --seq-len 64 --vocab-size 2048 --d-model 256 --n-heads 8 \
+  --dtype float32 --warmup 2 --repeats 6
+```
+
+The RoR baseline uses the same custom partition and runs one
+reverse-over-reverse HVP per block. The max relative error is inflated by
+near-zero HVP entries; the max absolute error is at float32 noise scale.
+
+| Method | Max abs error vs grouped RoR | Max rel error vs grouped RoR | Mean time | Time vs `modular_qkv` | Median peak RSS | Peak RSS vs `modular_qkv` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `modular_qkv` | 7.451e-09 | 8.850e-01 | 62.089 ms | 1.00x | 214.90 MiB | 1.00x |
+| `ror_qkv` | 0.000e+00 | 0.000e+00 | 54.946 ms | 0.88x | 197.18 MiB | 0.92x |
+| `torch_backward` | n/a | n/a | 6.392 ms | 0.10x | 187.89 MiB | 0.87x |
+
+This qkv grouped case is currently also faster with grouped RoR on CPU. Its
+parameterized dependency graph differs from the successful sequential and
+ResNet cases: q/k/v are parallel parameterized fan-out nodes from the same
+LayerNorm activation, and their within-block cross terms appear only after the
+attention fan-in. The runtime now uses the custom-block dependency graph to
+stop q/k/v local channels at the projection input boundary, while still
+preserving downstream attention fan-in cross terms. The remaining cost is graph
+record/hook bookkeeping plus the primitive attention/matmul/softmax backward
+JVP packet work on a very small block count where grouped RoR has little
+repetition to amortize.
+
+The memory-lifecycle pass reduced this larger qkv fixture's ModularHVP median
+peak RSS from roughly 276 MiB to about 215 MiB by releasing record saved-tensor
+references and graph bookkeeping as soon as they are consumed. The small-qkv
+CPU timing is therefore treated mainly as a bookkeeping stress test; production
+nanochat-scale runs should be evaluated at realistic sequence length, width,
+and device placement.
 
 Current limitations:
 

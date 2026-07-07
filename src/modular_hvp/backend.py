@@ -14,9 +14,10 @@ from torch import nn
 class LocalDualActivations:
     """Opaque local dual activation payload saved by the runtime.
 
-    The fake backend keeps only parameter ids so the hook milestone does not
-    retain full input/output graphs. A real dual backend can replace this with
-    the primal and tangent data needed to dualize the corresponding backward.
+    The lightweight test backend keeps only parameter ids so hook-plumbing
+    tests do not retain full input/output graphs. A production dual backend can
+    replace this with the primal and tangent data needed to dualize the
+    corresponding backward.
     """
 
     parameter_ids: tuple[int, ...]
@@ -49,7 +50,7 @@ class DualBackend(Protocol):
 
 
 class FakeDualBackend:
-    """Allocation-light backend for the hook-plumbing milestone.
+    """Allocation-light backend for generic hook-plumbing tests.
 
     This backend deliberately does not compute curvature. It validates that
     forward-produced local dual activation records are consumed during backward

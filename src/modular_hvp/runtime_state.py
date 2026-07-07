@@ -49,6 +49,14 @@ class RuntimeState:
     )
     forward_records: list[ForwardRecord] = field(default_factory=list)
     active_graph: RecordedForwardGraph | None = None
+    same_block_input_tangent_node_ids_by_channel: dict[
+        nn.Parameter,
+        set[int],
+    ] = field(default_factory=dict)
+    parameterized_frontier_by_tensor_node: dict[int, set[nn.Parameter]] = (
+        field(default_factory=dict)
+    )
+    same_block_input_crossing_output_node_ids: set[int] = field(default_factory=set)
     curvatures_by_node_id: dict[int, list[Callable[[torch.Tensor], torch.Tensor]]] = (
         field(default_factory=dict)
     )

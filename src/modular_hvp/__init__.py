@@ -1,7 +1,6 @@
 """Public API for ModularHVP."""
 
 from modular_hvp.api import modular_hvp
-from modular_hvp.backend import FakeDualBackend, LocalDualActivations
 from modular_hvp.dual import (
     DualTensor,
     is_dual,
@@ -14,8 +13,6 @@ from modular_hvp.dual import (
 
 __all__ = [
     "DualTensor",
-    "FakeDualBackend",
-    "LocalDualActivations",
     "is_dual",
     "make_dual",
     "modular_hvp",

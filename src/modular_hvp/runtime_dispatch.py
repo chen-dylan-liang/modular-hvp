@@ -116,7 +116,7 @@ class GraphDispatchMixin:
                             primal_outputs=output,
                         )
                         if record is not None:
-                            item.register_hook(self._make_forward_record_hook(record))
+                            self._register_forward_record_hook(record, item)
                     graph_outputs.append(graph_output)
                 return tuple(graph_outputs)
             return output
@@ -130,7 +130,7 @@ class GraphDispatchMixin:
                 output=graph_output,
             )
             if record is not None:
-                output.register_hook(self._make_forward_record_hook(record))
+                self._register_forward_record_hook(record, output)
         return graph_output
 
     def _dispatch_graph_shape_function(
@@ -158,7 +158,7 @@ class GraphDispatchMixin:
             output_shape=output.shape,
         )
         if output.requires_grad:
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return graph_output
 
     def _dispatch_graph_chunk_function(
@@ -197,7 +197,7 @@ class GraphDispatchMixin:
                     start=start,
                     end=start + size,
                 )
-                item.register_hook(self._make_forward_record_hook(record))
+                self._register_forward_record_hook(record, item)
             graph_outputs.append(graph_output)
             start += size
         return tuple(graph_outputs)
@@ -230,7 +230,7 @@ class GraphDispatchMixin:
                 dim0=dim0,
                 dim1=dim1,
             )
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return graph_output
 
     def _dispatch_graph_contiguous_function(
@@ -257,7 +257,7 @@ class GraphDispatchMixin:
                 input_node_id=input_node_id,
                 output_node_id=graph_output.node_id,
             )
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return graph_output
 
     def _dispatch_graph_matmul_function(
@@ -290,17 +290,15 @@ class GraphDispatchMixin:
                     saved_attrs=("_saved_self", "_saved_mat1"),
                     expected_shape=left_primal.shape,
                     fallback=left_primal,
-                    always_keep_fallback=True,
                 ),
                 right_activation=_make_saved_tensor_ref(
                     grad_fn=output.grad_fn,
                     saved_attrs=("_saved_other", "_saved_mat2"),
                     expected_shape=right_primal.shape,
                     fallback=right_primal,
-                    always_keep_fallback=True,
                 ),
             )
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return graph_output
 
     def _dispatch_graph_mul_function(
@@ -326,7 +324,7 @@ class GraphDispatchMixin:
                 left_value=self._unwrap_graph_value(left),
                 right_value=self._unwrap_graph_value(right),
             )
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return graph_output
 
     def _dispatch_graph_div_function(
@@ -352,7 +350,7 @@ class GraphDispatchMixin:
                 left_value=self._unwrap_graph_value(left),
                 right_value=self._unwrap_graph_value(right),
             )
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return graph_output
 
     def _dispatch_graph_cat_function(
@@ -383,7 +381,7 @@ class GraphDispatchMixin:
                 input_shapes=tuple(item.shape for item in primal_tensors),
                 dim=dim,
             )
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return graph_output
 
     def _dispatch_graph_cast_function(
@@ -414,7 +412,7 @@ class GraphDispatchMixin:
                 input_dtype=input_primal.dtype,
                 output_dtype=output.dtype,
             )
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return graph_output
 
     def _dispatch_graph_unary_elementwise_function(
@@ -450,7 +448,7 @@ class GraphDispatchMixin:
                 kind=kind,
                 scalar=scalar,
             )
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return graph_output
 
     def _dispatch_graph_layer_norm_function(
@@ -507,7 +505,7 @@ class GraphDispatchMixin:
                 normalized_shape=normalized_shape,
                 eps=eps,
             )
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return graph_output
 
     def _dispatch_graph_softmax_function(
@@ -540,7 +538,7 @@ class GraphDispatchMixin:
                 output_activation=_make_softmax_output_activation_ref(output),
                 dim=dim,
             )
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return graph_output
 
     def _dispatch_graph_dropout_function(
@@ -595,7 +593,7 @@ class GraphDispatchMixin:
                 right_shape=_value_shape(right_primal),
                 output_shape=output.shape,
             )
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return graph_output
 
     def _make_primitive_record(
@@ -853,14 +851,12 @@ class GraphDispatchMixin:
                     saved_attrs=("_saved_self", "_saved_mat1"),
                     expected_shape=left_primal.shape,
                     fallback=left_primal,
-                    always_keep_fallback=True,
                 ),
                 right_activation=_make_saved_tensor_ref(
                     grad_fn=output.primal.grad_fn,
                     saved_attrs=("_saved_other", "_saved_mat2"),
                     expected_shape=right_primal.shape,
                     fallback=right_primal,
-                    always_keep_fallback=True,
                 ),
             )
         if func in {torch.ops.aten.div.Tensor, torch.ops.aten.div.Scalar}:

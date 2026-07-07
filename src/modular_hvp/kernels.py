@@ -1179,12 +1179,8 @@ def _attention_backward_jvp(
         if score_tangent is not None
         else None
     )
-    _, score_grad = _attention_value_and_score_grads(
-        attention,
-        value,
-        grad_output,
-    )
     attention_grad = torch.matmul(grad_output, value.transpose(-2, -1))
+    score_grad = _softmax_backward_program(attention, attention_grad, -1)
 
     value_grad_tangent = None
     if attention_tangent is not None:

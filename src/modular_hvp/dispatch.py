@@ -51,6 +51,10 @@ def _is_python_cat(func: Any) -> bool:
     return getattr(func, "__name__", None) == "cat"
 
 
+def _is_python_linear(func: Any) -> bool:
+    return getattr(func, "__name__", None) == "linear"
+
+
 def _is_python_dtype_cast(func: Any) -> bool:
     return getattr(func, "__name__", None) in {"to", "float"}
 

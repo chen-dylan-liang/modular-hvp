@@ -8,6 +8,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from modular_hvp.block_graph import validate_parameter_blocks_on_graph
 from modular_hvp.graph import (
     RecordedForwardGraph,
     _record_has_backward_nonlinearity_tangents,
@@ -80,6 +81,7 @@ from modular_hvp.records import (
     _record_input_node_ids,
     _record_local_output_tangents,
     _record_output_node_id,
+    _release_record_saved_tensors,
 )
 
 
@@ -89,7 +91,7 @@ class BackwardRuntimeMixin:
         if loss_record is None:
             raise RuntimeError(
                 "modular_hvp did not observe a supported scalar loss; "
-                "currently use torch.nn.MSELoss or torch.nn.functional.mse_loss"
+                "currently use supported MSE loss or cross_entropy reductions"
             )
 
         with torch.no_grad():
@@ -99,23 +101,38 @@ class BackwardRuntimeMixin:
             if self._state.output_node_id is None:
                 raise RuntimeError("missing model output node for ModularHVP backward")
             if self._state.use_graph_curvature:
+                same_block_input_node_ids_by_channel: dict[
+                    nn.Parameter,
+                    set[int],
+                ] = {}
+                if self._requires_graph_block_scope:
+                    same_block_input_node_ids_by_channel = (
+                        self._validate_custom_blocks_on_recorded_graph()
+                    )
+                self._state.same_block_input_tangent_node_ids_by_channel = (
+                    same_block_input_node_ids_by_channel
+                )
+                extra_retained_node_ids: set[int] = set()
+                for node_ids in same_block_input_node_ids_by_channel.values():
+                    extra_retained_node_ids.update(node_ids)
                 graph = RecordedForwardGraph.from_records(
                     records=self._state.forward_records,
                     output_node_id=self._state.output_node_id,
-                    retain_local_parameter_inputs=(
-                        self._has_reused_parameters
-                        or self._requires_graph_block_scope
-                    ),
+                    retain_local_parameter_inputs=self._has_reused_parameters,
+                    extra_retained_forward_tangent_node_ids=extra_retained_node_ids,
+                )
+                requires_same_block_input_jvp = bool(
+                    same_block_input_node_ids_by_channel
                 )
                 if (
                     graph.requires_hooked_primal_grads
                     or self._has_reused_parameters
-                    or self._requires_graph_block_scope
+                    or requires_same_block_input_jvp
                 ):
                     self._state.active_graph = graph
+                    self._state.eager_backward_active = True
                     self._initialize_graph_hvp_hook_state(graph)
                     self._state.loss_record = None
-                    self._state.eager_backward_active = True
                     return
                 self._state.active_graph = None
                 self._compute_graph_hvps_single_pass(graph)
@@ -132,6 +149,23 @@ class BackwardRuntimeMixin:
         curvature: Callable[[torch.Tensor], torch.Tensor],
     ) -> None:
         self._state.curvatures_by_node_id.setdefault(node_id, []).append(curvature)
+
+    def _validate_custom_blocks_on_recorded_graph(
+        self,
+    ) -> dict[nn.Parameter, set[int]]:
+        retained_by_parameter = validate_parameter_blocks_on_graph(
+            records=self._state.forward_records,
+            raw_parameter_tangents_by_node=self._state.raw_parameter_tangents_by_node,
+            block_parameters_by_parameter=self._block_parameters_by_parameter,
+            parameter_names={
+                block.parameter: block.name for block in self.parameter_blocks
+            },
+        )
+        retained_by_channel: dict[nn.Parameter, set[int]] = {}
+        for parameter, node_ids in retained_by_parameter.items():
+            channel = self._block_channel_by_parameter[parameter]
+            retained_by_channel.setdefault(channel, set()).update(node_ids)
+        return retained_by_channel
 
     def _take_node_curvature(
         self,
@@ -151,35 +185,103 @@ class BackwardRuntimeMixin:
 
         return summed_curvature
 
-    def _make_forward_record_hook(self, record: ForwardRecord) -> Any:
-        self._state.forward_records.append(record)
+    def _register_forward_record_hook(
+        self,
+        record: ForwardRecord,
+        output: torch.Tensor,
+    ) -> None:
+        if self._use_graph_tensors:
+            self._state.forward_records.append(record)
+            self._update_parameterized_frontier(record)
+            if self._has_reused_parameters:
+                self._state.use_graph_curvature = True
+            if isinstance(
+                record,
+                (
+                    FunctionalLinearForwardRecord,
+                    FunctionalLayerNormForwardRecord,
+                    DropoutForwardRecord,
+                    MaskedFillForwardRecord,
+                    AddForwardRecord,
+                    MulForwardRecord,
+                    CatForwardRecord,
+                    SliceForwardRecord,
+                    SelectForwardRecord,
+                    TransposeForwardRecord,
+                    ContiguousForwardRecord,
+                    CastForwardRecord,
+                    UnaryElementwiseForwardRecord,
+                    RMSNormForwardRecord,
+                    MatmulForwardRecord,
+                    DivForwardRecord,
+                    SoftmaxForwardRecord,
+                    ScaledDotProductAttentionForwardRecord,
+                ),
+            ):
+                self._state.use_graph_curvature = True
+        if not output.requires_grad:
+            return
+        if self._should_register_forward_record_hook(record):
+            output.register_hook(self._make_forward_record_hook(record))
+
+    def _should_register_forward_record_hook(self, record: ForwardRecord) -> bool:
+        if not self._use_graph_tensors:
+            return True
+        if not self._state.use_graph_curvature:
+            return True
         if self._has_reused_parameters:
-            self._state.use_graph_curvature = True
+            return True
         if isinstance(
             record,
             (
-                FunctionalLinearForwardRecord,
                 FunctionalLayerNormForwardRecord,
-                DropoutForwardRecord,
-                MaskedFillForwardRecord,
-                AddForwardRecord,
-                MulForwardRecord,
-                CatForwardRecord,
-                SliceForwardRecord,
-                SelectForwardRecord,
-                TransposeForwardRecord,
-                ContiguousForwardRecord,
-                CastForwardRecord,
-                UnaryElementwiseForwardRecord,
-                RMSNormForwardRecord,
+                GELUForwardRecord,
+                LayerNormForwardRecord,
                 MatmulForwardRecord,
-                DivForwardRecord,
-                SoftmaxForwardRecord,
+                MulForwardRecord,
+                RMSNormForwardRecord,
                 ScaledDotProductAttentionForwardRecord,
+                SoftmaxForwardRecord,
+                UnaryElementwiseForwardRecord,
             ),
         ):
-            self._state.use_graph_curvature = True
+            return True
+        if isinstance(record, DivForwardRecord):
+            return record.right_node_id is not None
+        if not self._requires_graph_block_scope:
+            return False
+        return (
+            _record_output_node_id(record)
+            in self._state.same_block_input_crossing_output_node_ids
+        )
 
+    def _update_parameterized_frontier(self, record: ForwardRecord) -> None:
+        if not self._use_graph_tensors:
+            return
+
+        input_frontier: set[nn.Parameter] = set()
+        frontier_by_node = self._state.parameterized_frontier_by_tensor_node
+        for input_node_id in _record_input_node_ids(record):
+            input_frontier.update(frontier_by_node.get(input_node_id, ()))
+
+        local_channels = set(
+            self._local_channels_for_parameters(
+                tuple(_record_local_output_tangents(record)),
+            ),
+        )
+        output_node_id = _record_output_node_id(record)
+        if local_channels:
+            if input_frontier & local_channels:
+                self._state.same_block_input_crossing_output_node_ids.add(
+                    output_node_id,
+                )
+            frontier_by_node[output_node_id] = local_channels
+            return
+
+        if input_frontier:
+            frontier_by_node[output_node_id] = input_frontier
+
+    def _make_forward_record_hook(self, record: ForwardRecord) -> Any:
         def forward_record_hook(grad: torch.Tensor) -> torch.Tensor:
             if not self._state.eager_backward_active:
                 return grad
@@ -270,6 +372,11 @@ class BackwardRuntimeMixin:
         for parameter, tangent_value in output_tangents.items():
             output_grad_tangents[parameter] = output_curvature(tangent_value)
         output_tangents.clear()
+        primal_grad_required_output_node_ids = {
+            _record_output_node_id(record)
+            for record in graph.records
+            if self._record_requires_primal_grad_for_current_graph(record)
+        }
         local_parameters_by_output_node = _take_graph_local_parameters_by_output_node(
             graph.records
         )
@@ -282,9 +389,9 @@ class BackwardRuntimeMixin:
                 local_parameters_by_output_node,
             ),
             input_use_counts=graph.fresh_input_use_counts(),
+            primal_grad_required_output_node_ids=primal_grad_required_output_node_ids,
         )
-        for block in self.parameter_blocks:
-            setattr(block.parameter, "hvp", torch.zeros_like(block.parameter))
+        self._drain_ready_graph_backward_records()
 
     def _compute_graph_forward_tangent_packets(
         self,
@@ -369,28 +476,49 @@ class BackwardRuntimeMixin:
 
             output_grad_tangents = graph_state.pop_output_grad_tangents(record)
             local_parameters = graph_state.local_parameters_for(record)
+            requires_primal_grad = graph_state.requires_primal_grad(record)
+            primal_grad = (
+                graph_state.primal_grad(record) if requires_primal_grad else None
+            )
             self._accumulate_graph_record_hvps(
                 record,
                 output_grad_tangents,
-                primal_grad=graph_state.primal_grad(record),
+                primal_grad=primal_grad,
                 forward_tangents_by_node=graph_state.forward_tangents_by_node,
             )
-            for channel in self._local_channels_for_parameters(local_parameters):
-                if graph_state.consume_local_parameter_use(channel) == 0:
-                    output_grad_tangents.pop(channel, None)
-
-            if output_grad_tangents or _record_has_backward_nonlinearity_tangents(
+            blocked_local_channels = self._prune_consumed_local_channels(
                 record,
-                graph_state.forward_tangents_by_node,
+                local_parameters,
+                output_grad_tangents,
+                graph_state,
+            )
+
+            has_backward_nonlinearity_tangents = (
+                _record_has_backward_nonlinearity_tangents(
+                    record,
+                    graph_state.forward_tangents_by_node,
+                )
+            )
+            if requires_primal_grad and (
+                output_grad_tangents or has_backward_nonlinearity_tangents
             ):
+                if primal_grad is None:
+                    raise RuntimeError("missing required primal grad for graph record")
                 _propagate_backward_tangent_packet_with_grad(
                     record,
-                    graph_state.primal_grad(record),
+                    primal_grad,
                     output_grad_tangents,
                     graph_state.forward_tangents_by_node,
                     graph_state.grad_tangents_by_node,
                     self._tangents_by_parameter,
                     self._block_channel_by_parameter,
+                    blocked_local_channels,
+                )
+            elif output_grad_tangents:
+                _propagate_backward_tangent_packet(
+                    record,
+                    output_grad_tangents,
+                    graph_state.grad_tangents_by_node,
                 )
 
             graph_state.finish_record(graph, record)
@@ -400,8 +528,8 @@ class BackwardRuntimeMixin:
             for block in self.parameter_blocks:
                 if getattr(block.parameter, "hvp", None) is None:
                     setattr(block.parameter, "hvp", torch.zeros_like(block.parameter))
-            self._state.active_graph = None
             self._state.eager_backward_active = False
+            self._clear_completed_graph_bookkeeping()
 
     def _compute_graph_hvps_single_pass(self, graph: RecordedForwardGraph) -> None:
         output_curvature = self._state.output_curvature
@@ -411,6 +539,9 @@ class BackwardRuntimeMixin:
         tangents_by_node: dict[int, dict[nn.Parameter, torch.Tensor]] = {
             node_id: self._parameter_packet_to_channel_packet(packet)
             for node_id, packet in self._state.raw_parameter_tangents_by_node.items()
+        }
+        tangent_channels_by_node: dict[int, set[nn.Parameter]] = {
+            node_id: set(packet) for node_id, packet in tangents_by_node.items() if packet
         }
         remaining_input_uses = graph.fresh_input_use_counts()
         for record in graph.records:
@@ -447,6 +578,9 @@ class BackwardRuntimeMixin:
                         parameter,
                         tangent_value,
                     )
+                tangent_channels_by_node[_record_output_node_id(record)] = set(
+                    node_tangents
+                )
 
         output_tangents = tangents_by_node.get(graph.output_node_id, {})
         tangents_by_node.clear()
@@ -468,31 +602,35 @@ class BackwardRuntimeMixin:
         self._state.graph.local_parameters_by_output_node = local_parameters_by_output_node
 
         for record in graph.reverse_records:
-            output_grad_tangents = grad_tangents_by_node.pop(
-                _record_output_node_id(record),
-                None,
-            )
-            if not output_grad_tangents:
-                _record_local_output_tangents(record).clear()
-                continue
+            try:
+                output_grad_tangents = grad_tangents_by_node.pop(
+                    _record_output_node_id(record),
+                    None,
+                )
+                if not output_grad_tangents:
+                    _record_local_output_tangents(record).clear()
+                    continue
 
-            local_parameters = self._state.graph.local_parameters_for(record)
-            self._accumulate_graph_record_hvps(record, output_grad_tangents)
-            for channel in self._local_channels_for_parameters(local_parameters):
-                remaining = remaining_local_uses_by_channel.get(channel, 0)
-                if remaining <= 1:
-                    remaining_local_uses_by_channel.pop(channel, None)
-                    output_grad_tangents.pop(channel, None)
-                else:
-                    remaining_local_uses_by_channel[channel] = remaining - 1
-            if not output_grad_tangents:
-                continue
+                local_parameters = self._state.graph.local_parameters_for(record)
+                self._accumulate_graph_record_hvps(record, output_grad_tangents)
+                for channel in self._local_channels_for_parameters(local_parameters):
+                    remaining = remaining_local_uses_by_channel.get(channel, 0)
+                    if remaining <= 1:
+                        remaining_local_uses_by_channel.pop(channel, None)
+                        output_grad_tangents.pop(channel, None)
+                    else:
+                        remaining_local_uses_by_channel[channel] = remaining - 1
+                if not output_grad_tangents:
+                    continue
 
-            _propagate_backward_tangent_packet(
-                record,
-                output_grad_tangents,
-                grad_tangents_by_node,
-            )
+                _propagate_backward_tangent_packet(
+                    record,
+                    output_grad_tangents,
+                    grad_tangents_by_node,
+                    tangent_channels_by_node,
+                )
+            finally:
+                _release_record_saved_tensors(record)
 
         self._accumulate_raw_parameter_graph_hvps(grad_tangents_by_node)
 
@@ -500,6 +638,18 @@ class BackwardRuntimeMixin:
             if getattr(block.parameter, "hvp", None) is None:
                 setattr(block.parameter, "hvp", torch.zeros_like(block.parameter))
         self._state.graph.local_parameters_by_output_node.clear()
+        self._clear_completed_graph_bookkeeping()
+
+    def _clear_completed_graph_bookkeeping(self) -> None:
+        self._state.forward_records.clear()
+        self._state.active_graph = None
+        self._state.output_curvature = None
+        self._state.raw_parameter_tangents_by_node.clear()
+        self._state.same_block_input_tangent_node_ids_by_channel.clear()
+        self._state.parameterized_frontier_by_tensor_node.clear()
+        self._state.same_block_input_crossing_output_node_ids.clear()
+        self._state.curvatures_by_node_id.clear()
+        self._state.graph.clear()
 
     def _parameter_packet_to_channel_packet(
         self,
@@ -549,6 +699,94 @@ class BackwardRuntimeMixin:
             seen.add(channel)
             channels.append(channel)
         return tuple(channels)
+
+    def _prune_consumed_local_channels(
+        self,
+        record: ForwardRecord,
+        local_parameters: tuple[nn.Parameter, ...],
+        output_grad_tangents: dict[nn.Parameter, torch.Tensor],
+        graph_state: Any,
+    ) -> frozenset[nn.Parameter]:
+        """Stop block-local channels at parameterized input boundaries.
+
+        A local channel may cross the input edge of this record only when the
+        custom block graph proved that another parameterized node in the same
+        block reaches this record's input. This preserves q/k/v-style fan-out
+        locality while still allowing sequential/full blocks to carry their
+        local epsilon through the within-block chain.
+        """
+
+        if not local_parameters:
+            return frozenset()
+
+        blocked_channels: set[nn.Parameter] = set()
+        for channel in self._local_channels_for_parameters(local_parameters):
+            if self._local_channel_may_cross_record_input(record, channel):
+                if graph_state.consume_local_parameter_use(channel) == 0:
+                    blocked_channels.add(channel)
+                    output_grad_tangents.pop(channel, None)
+                continue
+
+            graph_state.consume_local_parameter_use(channel)
+            blocked_channels.add(channel)
+            output_grad_tangents.pop(channel, None)
+
+        if not blocked_channels:
+            return frozenset()
+        return frozenset(
+            parameter
+            for parameter in local_parameters
+            if self._block_channel_by_parameter[parameter] in blocked_channels
+        )
+
+    def _local_channel_may_cross_record_input(
+        self,
+        record: ForwardRecord,
+        channel: nn.Parameter,
+    ) -> bool:
+        if self._has_reused_parameters:
+            return True
+        retained_input_node_ids = (
+            self._state.same_block_input_tangent_node_ids_by_channel.get(channel)
+        )
+        if not retained_input_node_ids:
+            return False
+        return any(
+            input_node_id in retained_input_node_ids
+            for input_node_id in _record_input_node_ids(record)
+        )
+
+    def _record_requires_primal_grad_for_current_graph(
+        self,
+        record: ForwardRecord,
+    ) -> bool:
+        if self._has_reused_parameters:
+            return True
+        if isinstance(
+            record,
+            (
+                FunctionalLayerNormForwardRecord,
+                GELUForwardRecord,
+                LayerNormForwardRecord,
+                MatmulForwardRecord,
+                MulForwardRecord,
+                RMSNormForwardRecord,
+                ScaledDotProductAttentionForwardRecord,
+                SoftmaxForwardRecord,
+                UnaryElementwiseForwardRecord,
+            ),
+        ):
+            return True
+        if isinstance(record, DivForwardRecord):
+            return record.right_node_id is not None
+        if not self._requires_graph_block_scope:
+            return False
+        return any(
+            self._local_channel_may_cross_record_input(record, channel)
+            for channel in self._local_channels_for_parameters(
+                tuple(_record_local_output_tangents(record)),
+            )
+        )
 
     def _accumulate_raw_parameter_graph_hvps(
         self,

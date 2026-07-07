@@ -338,8 +338,11 @@ class SavedTensorRef:
         try:
             return self.resolve()
         finally:
-            self.grad_fn = None
-            self.fallback = None
+            self.release()
+
+    def release(self) -> None:
+        self.grad_fn = None
+        self.fallback = None
 
 
 def _find_saved_tensor(
@@ -454,3 +457,50 @@ def _record_input_node_ids(record: ForwardRecord) -> tuple[int, ...]:
             if node_id is not None
         )
     raise TypeError(f"unknown forward record: {type(record).__name__}")
+
+
+def _release_record_saved_tensors(record: ForwardRecord) -> None:
+    refs: tuple[SavedTensorRef | None, ...]
+    if isinstance(
+        record,
+        (
+            LinearForwardRecord,
+            FunctionalLinearForwardRecord,
+            Conv2dForwardRecord,
+            BatchNorm2dForwardRecord,
+            AvgPool2dForwardRecord,
+            AdaptiveAvgPool2dForwardRecord,
+        ),
+    ):
+        refs = (record.input_activation,)
+    elif isinstance(record, LayerNormForwardRecord):
+        refs = (record.input_activation, record.mean, record.rstd)
+    elif isinstance(record, FunctionalLayerNormForwardRecord):
+        refs = (record.input_activation, record.mean, record.rstd)
+    elif isinstance(record, RMSNormForwardRecord):
+        refs = (record.input_activation,)
+    elif isinstance(record, ReLUForwardRecord):
+        refs = (record.output_activation,)
+    elif isinstance(record, GELUForwardRecord):
+        refs = (record.input_activation,)
+    elif isinstance(record, MaxPool2dForwardRecord):
+        refs = (record.input_activation, record.indices)
+    elif isinstance(record, UnaryElementwiseForwardRecord):
+        refs = (record.input_activation, record.output_activation)
+    elif isinstance(record, MatmulForwardRecord):
+        refs = (record.left_activation, record.right_activation)
+    elif isinstance(record, SoftmaxForwardRecord):
+        refs = (record.output_activation,)
+    elif isinstance(record, DropoutForwardRecord):
+        refs = (record.multiplier,)
+    elif isinstance(record, ScaledDotProductAttentionForwardRecord):
+        refs = (
+            record.query_activation,
+            record.key_activation,
+            record.value_activation,
+        )
+    else:
+        refs = ()
+    for ref in refs:
+        if ref is not None:
+            ref.release()

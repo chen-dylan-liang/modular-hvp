@@ -8,7 +8,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from modular_hvp.backend import DualBackend, FakeDualBackend
+from modular_hvp.backend import DualBackend
 from modular_hvp.eager import EagerHVPRuntime
 from modular_hvp.runtime import ModularHVPRuntime
 
@@ -37,7 +37,8 @@ def modular_hvp(
         supported eager tensor graph scope.
     blocks:
         Optional block partition. Each mapping value lists the parameters that
-        share one local epsilon. When omitted, every parameter is its own block.
+        share one local epsilon. Parameters not listed in this mapping remain
+        singleton blocks. When omitted, every parameter is its own block.
     """
 
     if not isinstance(model, nn.Module):

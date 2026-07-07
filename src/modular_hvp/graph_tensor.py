@@ -17,6 +17,7 @@ from modular_hvp.dispatch import (
     _is_python_dtype_cast,
     _is_python_flatten,
     _is_python_layer_norm,
+    _is_python_linear,
     _is_python_masked_fill,
     _is_python_matmul,
     _is_python_multi_head_attention_forward,
@@ -113,6 +114,12 @@ class GraphTensor(torch.Tensor):
             return runtime._dispatch_graph_div_function(func, args, kwargs)
         if _is_python_cat(func):
             return runtime._dispatch_graph_cat_function(func, args, kwargs)
+        if _is_python_linear(func):
+            return runtime._dispatch_graph_op(
+                torch.ops.aten.linear.default,
+                args,
+                kwargs,
+            )
         if _is_python_dtype_cast(func):
             return runtime._dispatch_graph_cast_function(func, args, kwargs)
         if _is_python_unary_elementwise(func):

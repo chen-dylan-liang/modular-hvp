@@ -1,0 +1,60 @@
+{
+  "config": {
+    "seed": 0,
+    "batch_size": 2,
+    "image_size": 8,
+    "width": 2,
+    "d_out": 3,
+    "dtype": "float32",
+    "device": "cpu",
+    "warmup": 1,
+    "repeats": 3,
+    "rss_sample_interval_ms": 1.0
+  },
+  "block_partition": "Conv2d/Linear direct parameters grouped; all others singleton",
+  "comparisons": {
+    "modular_conv_linear": {
+      "max_abs": 2.9802322387695312e-08,
+      "max_rel": 6.904419412872693e-07
+    },
+    "ror_conv_linear": {
+      "max_abs": 0.0,
+      "max_rel": 0.0
+    }
+  },
+  "stats": [
+    {
+      "method": "modular_conv_linear",
+      "mean_time_s": 0.2996976499998709,
+      "min_time_s": 0.29854290100047365,
+      "max_time_s": 0.3004139760014368,
+      "median_peak_rss_bytes": 184967168,
+      "peak_rss_bytes": 185843712,
+      "median_avg_rss_bytes": 184774503,
+      "peak_python_alloc_bytes": 451848,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "method": "ror_conv_linear",
+      "mean_time_s": 0.404921326667439,
+      "min_time_s": 0.40325586999824736,
+      "max_time_s": 0.40600323200487765,
+      "median_peak_rss_bytes": 185675776,
+      "peak_rss_bytes": 185835520,
+      "median_avg_rss_bytes": 185613261,
+      "peak_python_alloc_bytes": 43052,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "method": "torch_backward",
+      "mean_time_s": 0.011565962665675519,
+      "min_time_s": 0.010836503002792597,
+      "max_time_s": 0.012334216997260228,
+      "median_peak_rss_bytes": 181223424,
+      "peak_rss_bytes": 181563392,
+      "median_avg_rss_bytes": 181177685,
+      "peak_python_alloc_bytes": 34146,
+      "peak_cuda_alloc_bytes": null
+    }
+  ]
+}

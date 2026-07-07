@@ -12,11 +12,6 @@ from torch import nn
 from torch.utils.hooks import RemovableHandle
 
 from modular_hvp.backend import DualBackend, LocalDualActivations
-from modular_hvp.model_utils import (
-    _can_use_sequential_fast_path,
-    _is_supported_leaf_module,
-)
-
 
 @dataclass(frozen=True, slots=True)
 class ParameterBlock:
@@ -404,16 +399,12 @@ def _resolve_parameter_block_groups(
             raise ValueError(f"block {block_key!r} is empty")
         block_groups.append(tuple(group))
 
-    missing = [
-        parameter_names_by_id[id(parameter)]
+    block_groups.extend(
+        (parameter,)
         for parameter in trainable_parameters
         if id(parameter) not in seen_parameter_ids
-    ]
-    if missing:
-        missing_text = ", ".join(repr(name) for name in missing)
-        raise ValueError(f"custom blocks do not cover trainable parameters: {missing_text}")
+    )
 
-    _validate_first_pass_block_groups(model, block_groups, parameter_names_by_id)
     return {
         parameter: group
         for group in block_groups
@@ -455,81 +446,6 @@ def _resolve_block_member_parameter(
             raise KeyError("block mapping contains a parameter outside the model")
         return member
     raise TypeError("block members must be parameter names or torch.nn.Parameter objects")
-
-
-def _validate_first_pass_block_groups(
-    model: nn.Module,
-    block_groups: Iterable[tuple[nn.Parameter, ...]],
-    parameter_names_by_id: Mapping[int, str],
-) -> None:
-    """Validate supported custom block shapes."""
-
-    grouped_blocks = [group for group in block_groups if len(group) > 1]
-    if not grouped_blocks:
-        return
-    if not (_can_use_sequential_fast_path(model) or _is_supported_leaf_module(model)):
-        raise NotImplementedError(
-            "custom module-wise blocks currently require a supported nn.Sequential "
-            "model or one supported leaf module"
-        )
-
-    direct_owners = _direct_parameter_owners(model)
-    parameter_order = {
-        parameter: index
-        for index, parameter in enumerate(dict(model.named_parameters()).values())
-    }
-
-    for group in grouped_blocks:
-        owners = {direct_owners.get(parameter) for parameter in group}
-        if None in owners:
-            names = ", ".join(
-                repr(parameter_names_by_id[id(parameter)])
-                for parameter in group
-            )
-            raise NotImplementedError(
-                "custom module-wise blocks require directly owned parameters; "
-                f"in the sequential first pass; got block {names}"
-            )
-        if len(owners) == 1:
-            owner = next(iter(owners))
-            if _is_supported_leaf_module(owner):
-                continue
-            names = ", ".join(
-                repr(parameter_names_by_id[id(parameter)])
-                for parameter in group
-            )
-            raise NotImplementedError(
-                "custom module-wise blocks currently require grouped parameters to "
-                f"belong to one supported leaf module; got block {names}"
-            )
-        if not _can_use_sequential_fast_path(model):
-            names = ", ".join(
-                repr(parameter_names_by_id[id(parameter)])
-                for parameter in group
-            )
-            raise NotImplementedError(
-                "blocks spanning multiple leaf modules currently require a supported "
-                f"nn.Sequential model; got block {names}"
-            )
-        if not all(isinstance(owner, nn.Linear) for owner in owners):
-            names = ", ".join(
-                repr(parameter_names_by_id[id(parameter)])
-                for parameter in group
-            )
-            raise NotImplementedError(
-                "blocks spanning multiple leaf modules are currently supported only "
-                f"for sequential Linear MLPs; got block {names}"
-            )
-        positions = sorted(parameter_order[parameter] for parameter in group)
-        if positions != list(range(positions[0], positions[-1] + 1)):
-            names = ", ".join(
-                repr(parameter_names_by_id[id(parameter)])
-                for parameter in group
-            )
-            raise NotImplementedError(
-                "blocks spanning multiple leaf modules must form a contiguous "
-                f"parameter span in the sequential model; got block {names}"
-            )
 
 
 def _direct_parameter_owners(model: nn.Module) -> dict[nn.Parameter, nn.Module]:

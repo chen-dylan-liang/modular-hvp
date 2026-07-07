@@ -569,11 +569,19 @@ def _propagate_backward_tangent_packet(
     record: ForwardRecord,
     output_grad_tangents: Mapping[nn.Parameter, torch.Tensor],
     grad_tangents_by_node: dict[int, dict[nn.Parameter, torch.Tensor]],
+    tangent_channels_by_node: Mapping[int, set[nn.Parameter]] | None = None,
 ) -> None:
     if isinstance(record, LinearForwardRecord):
+        items = _packet_items_for_node(
+            output_grad_tangents,
+            record.input_node_id,
+            tangent_channels_by_node,
+        )
+        if not items:
+            return
         weight = record.module.weight.detach()
         node_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
-        for parameter, output_grad_tangent in output_grad_tangents.items():
+        for parameter, output_grad_tangent in items:
             _accumulate_parameter_tensor(
                 node_packet,
                 parameter,
@@ -596,12 +604,19 @@ def _propagate_backward_tangent_packet(
         return
 
     if isinstance(record, Conv2dForwardRecord):
+        items = _packet_items_for_node(
+            output_grad_tangents,
+            record.input_node_id,
+            tangent_channels_by_node,
+        )
+        if not items:
+            return
         input_activation = _empty_from_saved_ref(
             record.input_activation,
-            next(iter(output_grad_tangents.values())),
+            items[0][1],
         )
         node_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
-        for parameter, output_grad_tangent in output_grad_tangents.items():
+        for parameter, output_grad_tangent in items:
             _accumulate_parameter_tensor(
                 node_packet,
                 parameter,
@@ -614,12 +629,19 @@ def _propagate_backward_tangent_packet(
         return
 
     if isinstance(record, BatchNorm2dForwardRecord):
+        items = _packet_items_for_node(
+            output_grad_tangents,
+            record.input_node_id,
+            tangent_channels_by_node,
+        )
+        if not items:
+            return
         input_activation = _empty_from_saved_ref(
             record.input_activation,
-            next(iter(output_grad_tangents.values())),
+            items[0][1],
         )
         node_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
-        for parameter, output_grad_tangent in output_grad_tangents.items():
+        for parameter, output_grad_tangent in items:
             _accumulate_parameter_tensor(
                 node_packet,
                 parameter,
@@ -690,9 +712,16 @@ def _propagate_backward_tangent_packet(
         return
 
     if isinstance(record, ReLUForwardRecord):
+        items = _packet_items_for_node(
+            output_grad_tangents,
+            record.input_node_id,
+            tangent_channels_by_node,
+        )
+        if not items:
+            return
         relu_output = record.output_activation.resolve().detach()
         node_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
-        for parameter, output_grad_tangent in output_grad_tangents.items():
+        for parameter, output_grad_tangent in items:
             _accumulate_parameter_tensor(
                 node_packet,
                 parameter,
@@ -716,8 +745,15 @@ def _propagate_backward_tangent_packet(
         return
 
     if isinstance(record, FlattenForwardRecord):
+        items = _packet_items_for_node(
+            output_grad_tangents,
+            record.input_node_id,
+            tangent_channels_by_node,
+        )
+        if not items:
+            return
         node_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
-        for parameter, output_grad_tangent in output_grad_tangents.items():
+        for parameter, output_grad_tangent in items:
             _accumulate_parameter_tensor(
                 node_packet,
                 parameter,
@@ -726,7 +762,14 @@ def _propagate_backward_tangent_packet(
         return
 
     if isinstance(record, AvgPool2dForwardRecord):
-        like = next(iter(output_grad_tangents.values()))
+        items = _packet_items_for_node(
+            output_grad_tangents,
+            record.input_node_id,
+            tangent_channels_by_node,
+        )
+        if not items:
+            return
+        like = items[0][1]
         input_activation = _empty_from_saved_ref(record.input_activation, like)
         kernel_size = _pair(record.module.kernel_size)
         stride = _pair(
@@ -736,7 +779,7 @@ def _propagate_backward_tangent_packet(
         )
         padding = _pair(record.module.padding)
         node_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
-        for parameter, output_grad_tangent in output_grad_tangents.items():
+        for parameter, output_grad_tangent in items:
             _accumulate_parameter_tensor(
                 node_packet,
                 parameter,
@@ -754,10 +797,17 @@ def _propagate_backward_tangent_packet(
         return
 
     if isinstance(record, AdaptiveAvgPool2dForwardRecord):
-        like = next(iter(output_grad_tangents.values()))
+        items = _packet_items_for_node(
+            output_grad_tangents,
+            record.input_node_id,
+            tangent_channels_by_node,
+        )
+        if not items:
+            return
+        like = items[0][1]
         input_activation = _empty_from_saved_ref(record.input_activation, like)
         node_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
-        for parameter, output_grad_tangent in output_grad_tangents.items():
+        for parameter, output_grad_tangent in items:
             _accumulate_parameter_tensor(
                 node_packet,
                 parameter,
@@ -769,7 +819,14 @@ def _propagate_backward_tangent_packet(
         return
 
     if isinstance(record, MaxPool2dForwardRecord):
-        like = next(iter(output_grad_tangents.values()))
+        items = _packet_items_for_node(
+            output_grad_tangents,
+            record.input_node_id,
+            tangent_channels_by_node,
+        )
+        if not items:
+            return
+        like = items[0][1]
         input_activation = _empty_from_saved_ref(record.input_activation, like)
         module = record.module
         kernel_size = _pair(module.kernel_size)
@@ -778,7 +835,7 @@ def _propagate_backward_tangent_packet(
         dilation = _pair(module.dilation)
         indices = record.indices.resolve().detach()
         node_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
-        for parameter, output_grad_tangent in output_grad_tangents.items():
+        for parameter, output_grad_tangent in items:
             _accumulate_parameter_tensor(
                 node_packet,
                 parameter,
@@ -889,8 +946,15 @@ def _propagate_backward_tangent_packet(
 
     if isinstance(record, DropoutForwardRecord):
         multiplier = record.multiplier.resolve().detach()
+        grad_tangent_items = _packet_items_for_node(
+            output_grad_tangents,
+            record.input_node_id,
+            tangent_channels_by_node,
+        )
+        if not grad_tangent_items:
+            return
         node_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
-        for parameter, output_grad_tangent in output_grad_tangents.items():
+        for parameter, output_grad_tangent in grad_tangent_items:
             _accumulate_parameter_tensor(
                 node_packet,
                 parameter,
@@ -964,17 +1028,30 @@ def _propagate_backward_tangent_packet(
 
     if isinstance(record, AddForwardRecord):
         if record.left_node_id is not None:
-            left_packet = grad_tangents_by_node.setdefault(record.left_node_id, {})
-            for parameter, output_grad_tangent in output_grad_tangents.items():
+            items = _packet_items_for_node(
+                output_grad_tangents,
+                record.left_node_id,
+                tangent_channels_by_node,
+            )
+            if items:
+                left_packet = grad_tangents_by_node.setdefault(record.left_node_id, {})
+            for parameter, output_grad_tangent in items:
                 _accumulate_parameter_tensor(
                     left_packet,
                     parameter,
                     _unbroadcast_like(output_grad_tangent, record.left_shape),
                 )
         if record.right_node_id is not None:
+            items = _packet_items_for_node(
+                output_grad_tangents,
+                record.right_node_id,
+                tangent_channels_by_node,
+            )
+            if not items:
+                return
             alpha = record.alpha
             right_packet = grad_tangents_by_node.setdefault(record.right_node_id, {})
-            for parameter, output_grad_tangent in output_grad_tangents.items():
+            for parameter, output_grad_tangent in items:
                 value = output_grad_tangent if alpha == 1.0 else alpha * output_grad_tangent
                 _accumulate_parameter_tensor(
                     right_packet,
@@ -1096,24 +1173,33 @@ def _propagate_backward_tangent_packet_with_grad(
     grad_tangents_by_node: dict[int, dict[nn.Parameter, torch.Tensor]],
     parameter_tangents: Mapping[nn.Parameter, torch.Tensor],
     block_channel_by_parameter: Mapping[nn.Parameter, nn.Parameter] | None = None,
+    blocked_local_channels: frozenset[nn.Parameter] = frozenset(),
 ) -> None:
     if isinstance(record, LinearForwardRecord):
         weight = record.module.weight.detach()
-        input_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
         parameters = set(output_grad_tangents)
         weight_channel = (
             block_channel_by_parameter.get(record.module.weight, record.module.weight)
             if block_channel_by_parameter is not None
             else record.module.weight
         )
-        if record.module.weight is not None:
+        if (
+            record.module.weight is not None
+            and weight_channel not in blocked_local_channels
+        ):
             parameters.add(weight_channel)
+        if not parameters:
+            return
+        input_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
         for parameter in parameters:
             value = None
             grad_tangent = output_grad_tangents.get(parameter)
             if grad_tangent is not None:
                 value = _linear_input_backward_program(weight, grad_tangent)
-            if parameter is weight_channel:
+            if (
+                parameter is weight_channel
+                and weight_channel not in blocked_local_channels
+            ):
                 weight_tangent = parameter_tangents.get(record.module.weight)
                 if weight_tangent is not None:
                     term = _linear_input_backward_program(weight_tangent, grad)
@@ -1124,7 +1210,6 @@ def _propagate_backward_tangent_packet_with_grad(
 
     if isinstance(record, FunctionalLinearForwardRecord):
         weight = record.weight.detach()
-        input_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
         parameters = set(output_grad_tangents)
         if isinstance(record.weight, nn.Parameter):
             weight_channel = (
@@ -1132,9 +1217,13 @@ def _propagate_backward_tangent_packet_with_grad(
                 if block_channel_by_parameter is not None
                 else record.weight
             )
-            parameters.add(weight_channel)
+            if weight_channel not in blocked_local_channels:
+                parameters.add(weight_channel)
         else:
             weight_channel = None
+        if not parameters:
+            return
+        input_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
         for parameter in parameters:
             value = None
             grad_tangent = output_grad_tangents.get(parameter)
@@ -1144,6 +1233,7 @@ def _propagate_backward_tangent_packet_with_grad(
                 weight_channel is not None
                 and parameter is weight_channel
                 and isinstance(record.weight, nn.Parameter)
+                and weight_channel not in blocked_local_channels
             ):
                 weight_tangent = parameter_tangents.get(record.weight)
                 if weight_tangent is not None:
@@ -1503,6 +1593,18 @@ def _propagate_backward_tangent_packet_with_grad(
         output_grad_tangents,
         grad_tangents_by_node,
     )
+
+def _packet_items_for_node(
+    packet: Mapping[nn.Parameter, torch.Tensor],
+    node_id: int,
+    tangent_channels_by_node: Mapping[int, set[nn.Parameter]] | None,
+) -> list[tuple[nn.Parameter, torch.Tensor]]:
+    if tangent_channels_by_node is None:
+        return list(packet.items())
+    channels = tangent_channels_by_node.get(node_id)
+    if not channels:
+        return []
+    return [(parameter, value) for parameter, value in packet.items() if parameter in channels]
 
 
 def _accumulate_parameter_tensor(

@@ -81,6 +81,8 @@ class ForwardRuntimeMixin:
         for module in _iter_unique_supported_leaf_modules(self.model):
             if module is self.model:
                 continue
+            if self._should_dispatch_supported_leaf_through_graph(module):
+                continue
             original_forward = module.forward
             had_instance_forward = "forward" in module.__dict__
             instance_forward = module.__dict__.get("forward")
@@ -105,6 +107,11 @@ class ForwardRuntimeMixin:
                 )
             )
             module.forward = wrapped_leaf_forward  # type: ignore[method-assign]
+
+    def _should_dispatch_supported_leaf_through_graph(self, module: nn.Module) -> bool:
+        if not self._use_graph_tensors:
+            return False
+        return isinstance(module, (nn.Linear, nn.LayerNorm))
 
     def _original_forward_for(self, module: nn.Module) -> Any:
         for patch in reversed(self._state.forward_patches):
@@ -195,14 +202,8 @@ class ForwardRuntimeMixin:
             combined = local_output_tangents[group[0]]
             for group_parameter in group[1:]:
                 combined = combined + local_output_tangents[group_parameter]
-            if not self._use_graph_tensors:
-                for group_parameter in group:
-                    result[group_parameter] = combined
-                continue
             for group_parameter in group:
-                result[group_parameter] = combined.clone(
-                    memory_format=torch.preserve_format
-                )
+                result[group_parameter] = combined
         return result
 
     def _install_raw_parameter_graph_sources(self) -> None:
@@ -224,6 +225,9 @@ class ForwardRuntimeMixin:
             )
             self._state.raw_parameter_tangents_by_node[node_id] = {
                 parameter: tangent_value.detach()
+            }
+            self._state.parameterized_frontier_by_tensor_node[node_id] = {
+                self._block_channel_by_parameter[parameter],
             }
             module._parameters[parameter_name] = graph_parameter
 
@@ -350,6 +354,9 @@ class ForwardRuntimeMixin:
         self._state.raw_parameter_tangents_by_node.clear()
         self._state.forward_records.clear()
         self._state.active_graph = None
+        self._state.same_block_input_tangent_node_ids_by_channel.clear()
+        self._state.parameterized_frontier_by_tensor_node.clear()
+        self._state.same_block_input_crossing_output_node_ids.clear()
         self._state.curvatures_by_node_id.clear()
         self._state.graph.clear()
         self._state.use_graph_curvature = self._requires_graph_block_scope
@@ -416,7 +423,7 @@ class ForwardRuntimeMixin:
                 mean=mean,
                 rstd=rstd,
             )
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return graph_output
 
     def _make_functional_layer_norm_record(
@@ -505,7 +512,7 @@ class ForwardRuntimeMixin:
                 output_node_id=output_node_id,
                 multiplier=_make_dropout_multiplier_ref(output, input_primal),
             )
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return runtime_output
 
     def _run_embedding_forward(
@@ -550,7 +557,7 @@ class ForwardRuntimeMixin:
             ),
         )
         if output.requires_grad:
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return runtime_output
 
     def _run_linear_forward(
@@ -610,7 +617,7 @@ class ForwardRuntimeMixin:
             ),
         )
         if output.requires_grad:
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return runtime_output
 
     def _run_conv2d_forward(
@@ -663,7 +670,7 @@ class ForwardRuntimeMixin:
             ),
         )
         if output.requires_grad:
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return runtime_output
 
     def _run_batch_norm2d_forward(
@@ -720,7 +727,7 @@ class ForwardRuntimeMixin:
             ),
         )
         if output.requires_grad:
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return runtime_output
 
     def _run_layer_norm_forward(
@@ -774,7 +781,7 @@ class ForwardRuntimeMixin:
             ),
         )
         if output.requires_grad:
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return runtime_output
 
     def _run_relu_forward(
@@ -797,7 +804,7 @@ class ForwardRuntimeMixin:
             output_activation=_make_relu_output_activation_ref(output),
         )
         if output.requires_grad:
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return runtime_output
 
     def _run_gelu_forward(
@@ -818,7 +825,7 @@ class ForwardRuntimeMixin:
             approximate=module.approximate,
         )
         if output.requires_grad:
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return runtime_output
 
     def _run_flatten_forward(
@@ -840,7 +847,7 @@ class ForwardRuntimeMixin:
             end_dim=module.end_dim,
         )
         if output.requires_grad:
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return runtime_output
 
     def _run_dropout_forward(
@@ -953,7 +960,7 @@ class ForwardRuntimeMixin:
             input_activation=_make_pool_input_activation_ref(output, input_primal_live),
         )
         if output.requires_grad:
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return runtime_output
 
     def _run_adaptive_avg_pool2d_forward(
@@ -977,7 +984,7 @@ class ForwardRuntimeMixin:
             output_size=_pair(module.output_size),
         )
         if output.requires_grad:
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return runtime_output
 
     def _run_max_pool2d_forward(
@@ -1003,7 +1010,7 @@ class ForwardRuntimeMixin:
             indices=_make_max_pool_indices_ref(output),
         )
         if output.requires_grad:
-            output.register_hook(self._make_forward_record_hook(record))
+            self._register_forward_record_hook(record, output)
         return runtime_output
 
     def _call_module_forward(

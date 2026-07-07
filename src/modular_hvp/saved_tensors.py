@@ -67,7 +67,6 @@ def _make_conv_input_activation_ref(
         saved_attrs=("_saved_input",),
         expected_shape=input_value.shape,
         fallback=input_value,
-        always_keep_fallback=True,
     )
 
 
@@ -80,7 +79,6 @@ def _make_batch_norm_input_activation_ref(
         saved_attrs=("_saved_input",),
         expected_shape=input_value.shape,
         fallback=input_value,
-        always_keep_fallback=True,
     )
 
 
@@ -103,10 +101,21 @@ def _make_layer_norm_mean_ref(
 ) -> SavedTensorRef:
     dims = _layer_norm_dims(input_value.dim(), module.normalized_shape)
     expected_shape = _layer_norm_stat_shape(input_value.shape, module.normalized_shape)
+    if output.grad_fn is not None and _find_saved_tensor(
+        output.grad_fn,
+        saved_attrs=("_saved_result1",),
+        expected_shape=expected_shape,
+    ) is not None:
+        return SavedTensorRef(
+            grad_fn=output.grad_fn,
+            saved_attrs=("_saved_result1",),
+            expected_shape=expected_shape,
+            fallback=None,
+        )
     with torch.no_grad():
         mean = input_value.detach().mean(dim=dims, keepdim=True)
-    return _make_saved_tensor_ref(
-        grad_fn=output.grad_fn,
+    return SavedTensorRef(
+        grad_fn=None,
         saved_attrs=("_saved_result1",),
         expected_shape=expected_shape,
         fallback=mean,
@@ -120,12 +129,23 @@ def _make_layer_norm_rstd_ref(
 ) -> SavedTensorRef:
     dims = _layer_norm_dims(input_value.dim(), module.normalized_shape)
     expected_shape = _layer_norm_stat_shape(input_value.shape, module.normalized_shape)
+    if output.grad_fn is not None and _find_saved_tensor(
+        output.grad_fn,
+        saved_attrs=("_saved_result2",),
+        expected_shape=expected_shape,
+    ) is not None:
+        return SavedTensorRef(
+            grad_fn=output.grad_fn,
+            saved_attrs=("_saved_result2",),
+            expected_shape=expected_shape,
+            fallback=None,
+        )
     with torch.no_grad():
         mean = input_value.detach().mean(dim=dims, keepdim=True)
         var = (input_value.detach() - mean).pow(2).mean(dim=dims, keepdim=True)
         rstd = torch.rsqrt(var + module.eps)
-    return _make_saved_tensor_ref(
-        grad_fn=output.grad_fn,
+    return SavedTensorRef(
+        grad_fn=None,
         saved_attrs=("_saved_result2",),
         expected_shape=expected_shape,
         fallback=rstd,
@@ -133,11 +153,11 @@ def _make_layer_norm_rstd_ref(
 
 
 def _make_relu_output_activation_ref(output: torch.Tensor) -> SavedTensorRef:
-    return SavedTensorRef(
+    return _make_saved_tensor_ref(
         grad_fn=output.grad_fn,
         saved_attrs=("_saved_result",),
         expected_shape=output.shape,
-        fallback=output.detach(),
+        fallback=output,
     )
 
 
@@ -154,11 +174,11 @@ def _make_gelu_input_activation_ref(
 
 
 def _make_softmax_output_activation_ref(output: torch.Tensor) -> SavedTensorRef:
-    return SavedTensorRef(
+    return _make_saved_tensor_ref(
         grad_fn=output.grad_fn,
         saved_attrs=("_saved_result",),
         expected_shape=output.shape,
-        fallback=output.detach(),
+        fallback=output,
     )
 
 

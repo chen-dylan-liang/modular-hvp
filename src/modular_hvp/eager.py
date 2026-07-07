@@ -18,6 +18,7 @@ from modular_hvp.model_utils import (
     _validate_supported_model,
 )
 from modular_hvp.runtime import (
+    _direct_parameter_owners,
     _has_multi_leaf_parameter_block,
     _resolve_parameter_block_groups,
     _resolve_parameter_blocks,
@@ -70,6 +71,17 @@ class EagerHVPRuntime(ForwardRuntimeMixin, GraphDispatchMixin, BackwardRuntimeMi
             parameter: group[0]
             for parameter, group in self._block_parameters_by_parameter.items()
         }
+        direct_owners = _direct_parameter_owners(model)
+        self._multi_leaf_block_parameters: set[nn.Parameter] = set()
+        seen_groups: set[tuple[int, ...]] = set()
+        for group in self._block_parameters_by_parameter.values():
+            group_key = tuple(id(parameter) for parameter in group)
+            if group_key in seen_groups:
+                continue
+            seen_groups.add(group_key)
+            owners = {direct_owners.get(parameter) for parameter in group}
+            if len(owners) > 1:
+                self._multi_leaf_block_parameters.update(group)
         self._parameter_use_counts = _parameter_use_counts(model)
         self._has_reused_parameters = any(
             count > 1 for count in self._parameter_use_counts.values()
@@ -126,6 +138,9 @@ class EagerHVPRuntime(ForwardRuntimeMixin, GraphDispatchMixin, BackwardRuntimeMi
         self._state.raw_parameter_tangents_by_node.clear()
         self._state.forward_records.clear()
         self._state.active_graph = None
+        self._state.same_block_input_tangent_node_ids_by_channel.clear()
+        self._state.parameterized_frontier_by_tensor_node.clear()
+        self._state.same_block_input_crossing_output_node_ids.clear()
         self._state.curvatures_by_node_id.clear()
         self._state.graph.clear()
         self._state.use_graph_curvature = False
