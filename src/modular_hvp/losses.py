@@ -72,9 +72,14 @@ def _make_loss_output_curvature(
 
         def cross_entropy_output_curvature(value: torch.Tensor) -> torch.Tensor:
             value = value.to(dtype=logits.dtype)
+            if not value.is_contiguous():
+                value = value.contiguous()
             weighted = (probabilities * value).sum(dim=-1, keepdim=True)
-            result = probabilities * (value - weighted)
-            return torch.where(valid.unsqueeze(-1), result, torch.zeros_like(result)) * grad_factor
+            value.sub_(weighted)
+            value.mul_(probabilities)
+            value.masked_fill_(~valid.unsqueeze(-1), 0)
+            value.mul_(grad_factor)
+            return value
 
         return cross_entropy_output_curvature
 

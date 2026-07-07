@@ -85,6 +85,17 @@ from modular_hvp.records import (
 )
 
 
+def _apply_output_curvature_packet(
+    output_curvature: Callable[[torch.Tensor], torch.Tensor],
+    output_tangents: dict[nn.Parameter, torch.Tensor],
+) -> dict[nn.Parameter, torch.Tensor]:
+    output_grad_tangents: dict[nn.Parameter, torch.Tensor] = {}
+    while output_tangents:
+        parameter, tangent_value = output_tangents.popitem()
+        output_grad_tangents[parameter] = output_curvature(tangent_value)
+    return output_grad_tangents
+
+
 class BackwardRuntimeMixin:
     def _start_eager_backward(self, grad: torch.Tensor) -> None:
         loss_record = self._state.loss_record
@@ -404,11 +415,10 @@ class BackwardRuntimeMixin:
             graph,
             retained_node_ids=graph.retained_forward_tangent_node_ids,
         )
-        output_tangents = tangents_by_node.pop(graph.output_node_id, {})
-        output_grad_tangents: dict[nn.Parameter, torch.Tensor] = {}
-        for parameter, tangent_value in output_tangents.items():
-            output_grad_tangents[parameter] = output_curvature(tangent_value)
-        output_tangents.clear()
+        output_grad_tangents = _apply_output_curvature_packet(
+            output_curvature,
+            tangents_by_node.pop(graph.output_node_id, {}),
+        )
         primal_grad_required_output_node_ids = {
             _record_output_node_id(record)
             for record in graph.records
@@ -635,10 +645,10 @@ class BackwardRuntimeMixin:
         output_tangents = tangents_by_node.get(graph.output_node_id, {})
         tangents_by_node.clear()
         grad_tangents_by_node: dict[int, dict[nn.Parameter, torch.Tensor]] = {
-            graph.output_node_id: {
-                parameter: output_curvature(tangent_value)
-                for parameter, tangent_value in output_tangents.items()
-            }
+            graph.output_node_id: _apply_output_curvature_packet(
+                output_curvature,
+                output_tangents,
+            )
         }
 
         local_parameters_by_output_node = {
