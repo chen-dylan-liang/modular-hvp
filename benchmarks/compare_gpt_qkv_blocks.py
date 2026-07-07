@@ -193,6 +193,22 @@ def qkv_blocks(model: nn.Module) -> dict[str, tuple[str, ...]]:
     return blocks
 
 
+def complete_partition_blocks(
+    model: nn.Module,
+    grouped_blocks: Mapping[str, tuple[str, ...]],
+) -> dict[str, tuple[str, ...]]:
+    blocks = dict(grouped_blocks)
+    covered = {
+        parameter_name
+        for block_names in grouped_blocks.values()
+        for parameter_name in block_names
+    }
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad and name not in covered:
+            blocks[name] = (name,)
+    return blocks
+
+
 def modular_per_parameter_hvp(
     model: nn.Module,
     idx: torch.Tensor,
@@ -233,7 +249,12 @@ def ror_qkv_hvp(
     targets: torch.Tensor,
     vectors: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    return _custom_block_ror_hvps(model(idx, targets), model, vectors, qkv_blocks(model))
+    return _custom_block_ror_hvps(
+        model(idx, targets),
+        model,
+        vectors,
+        complete_partition_blocks(model, qkv_blocks(model)),
+    )
 
 
 def torch_backward(
