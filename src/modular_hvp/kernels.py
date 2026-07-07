@@ -110,14 +110,17 @@ def _batch_norm2d_input_backward_program(
     input_activation: torch.Tensor,
     grad_output: torch.Tensor,
 ) -> torch.Tensor:
+    running_mean = _batch_norm_running_mean(module)
+    running_var = _batch_norm_running_var(module)
+    save_invstd = torch.rsqrt(running_var.detach() + module.eps)
     grad_input, _, _ = torch.ops.aten.native_batch_norm_backward.default(
         grad_output,
         input_activation,
         module.weight.detach() if module.weight is not None else None,
-        _batch_norm_running_mean(module),
-        _batch_norm_running_var(module),
-        None,
-        None,
+        running_mean,
+        running_var,
+        running_mean.detach(),
+        save_invstd,
         False,
         module.eps,
         (True, False, False),
@@ -130,14 +133,17 @@ def _batch_norm2d_weight_backward_program(
     input_activation: torch.Tensor,
     grad_output: torch.Tensor,
 ) -> torch.Tensor:
+    running_mean = _batch_norm_running_mean(module)
+    running_var = _batch_norm_running_var(module)
+    save_invstd = torch.rsqrt(running_var.detach() + module.eps)
     _, grad_weight, _ = torch.ops.aten.native_batch_norm_backward.default(
         grad_output,
         input_activation,
         module.weight.detach() if module.weight is not None else None,
-        _batch_norm_running_mean(module),
-        _batch_norm_running_var(module),
-        None,
-        None,
+        running_mean,
+        running_var,
+        running_mean.detach(),
+        save_invstd,
         False,
         module.eps,
         (False, True, False),
