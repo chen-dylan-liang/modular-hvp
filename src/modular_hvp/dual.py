@@ -963,6 +963,78 @@ def _native_batch_norm_rule(
     )
 
 
+def _cudnn_batch_norm_rule(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[DualTensor, DualTensor, DualTensor, torch.Tensor]:
+    (
+        input_value,
+        weight,
+        bias,
+        running_mean,
+        running_var,
+        training,
+        exponential_average_factor,
+        eps,
+    ) = args[:8]
+    input_p, input_t, input_is_dual = _split(input_value)
+    weight_p, weight_t, weight_is_dual = _split(weight)
+    bias_p, bias_t, bias_is_dual = _split(bias)
+    if is_dual(running_mean) or is_dual(running_var):
+        raise NotImplementedError(
+            "DualTensor rule not implemented for dual BatchNorm running statistics"
+        )
+    running_mean_p = primal(running_mean)
+    running_var_p = primal(running_var)
+
+    if _IN_TANGENT_EVAL.get():
+        primal_output, save_mean, save_invstd = _batch_norm_primal_no_stats_update(
+            input_p,
+            weight_p,
+            bias_p,
+            running_mean_p,
+            running_var_p,
+            training,
+            eps,
+        )
+        reserve = torch.empty(0, dtype=torch.uint8, device=input_p.device)
+    else:
+        primal_output, save_mean, save_invstd, reserve = _call_primal(
+            func,
+            input_p,
+            weight_p,
+            bias_p,
+            running_mean_p,
+            running_var_p,
+            training,
+            exponential_average_factor,
+            eps,
+            **kwargs,
+        )
+
+    with torch.no_grad():
+        tangent_output, save_mean_tangent, save_invstd_tangent = _batch_norm_tangent(
+            input_p,
+            input_t if input_is_dual else None,
+            weight_p,
+            weight_t if weight_is_dual else None,
+            bias_t if bias_is_dual else None,
+            running_mean_p,
+            running_var_p,
+            save_mean,
+            save_invstd,
+            training,
+            eps,
+        )
+    return (
+        _make_rule_output(primal_output, tangent_output),
+        _make_rule_output(save_mean, save_mean_tangent),
+        _make_rule_output(save_invstd, save_invstd_tangent),
+        reserve,
+    )
+
+
 def _batch_norm_primal_no_stats_update(
     input_value: torch.Tensor,
     weight: torch.Tensor | None,
@@ -1725,6 +1797,7 @@ _register("addmm", "default", _addmm_rule)
 _register("linear", "default", _linear_rule)
 _register("convolution", "default", _convolution_rule)
 _register("native_batch_norm", "default", _native_batch_norm_rule)
+_register("cudnn_batch_norm", "default", _cudnn_batch_norm_rule)
 
 for _name, _overload in (
     ("sum", "default"),
