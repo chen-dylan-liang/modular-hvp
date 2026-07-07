@@ -1,0 +1,138 @@
+{
+  "config": {
+    "depths": [
+      4,
+      50
+    ],
+    "seed": 0,
+    "batch_size": 256,
+    "d_in": 784,
+    "d_hidden": 256,
+    "d_out": 10,
+    "dtype": "float32",
+    "device": "cpu",
+    "warmup": 1,
+    "repeats": 3,
+    "rss_sample_interval_ms": 1.0
+  },
+  "comparisons": {
+    "4": {
+      "modular_linear_blocks_vs_autodiff_linear_blocks": {
+        "max_abs": 1.862645149230957e-09,
+        "max_rel": 4.0906343747172346e-07
+      },
+      "modular_per_parameter_vs_linear_blocks": {
+        "max_abs": 0.222970649600029,
+        "max_rel": 1.3608568187896335
+      }
+    },
+    "50": {
+      "modular_linear_blocks_vs_autodiff_linear_blocks": {
+        "max_abs": 9.685754776000977e-08,
+        "max_rel": 1.3867114851620142e-06
+      },
+      "modular_per_parameter_vs_linear_blocks": {
+        "max_abs": 0.3155113756656647,
+        "max_rel": 1.1429408402487866
+      }
+    }
+  },
+  "records": [
+    {
+      "depth": 4,
+      "method": "modular_per_parameter",
+      "mean_time_s": 0.017089348334896688,
+      "min_time_s": 0.01687269299873151,
+      "max_time_s": 0.017311595001956448,
+      "median_peak_rss_bytes": 185634816,
+      "peak_rss_bytes": 186007552,
+      "median_avg_rss_bytes": 182696345,
+      "peak_python_alloc_bytes": 34764,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "depth": 4,
+      "method": "modular_linear_blocks",
+      "mean_time_s": 0.01628412133383487,
+      "min_time_s": 0.01480322600400541,
+      "max_time_s": 0.017322670995781664,
+      "median_peak_rss_bytes": 185044992,
+      "peak_rss_bytes": 185184256,
+      "median_avg_rss_bytes": 181926656,
+      "peak_python_alloc_bytes": 33988,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "depth": 4,
+      "method": "backpack_autodiff_linear_blocks",
+      "mean_time_s": 0.01708198299941917,
+      "min_time_s": 0.016337046996341087,
+      "max_time_s": 0.01773016300285235,
+      "median_peak_rss_bytes": 240254976,
+      "peak_rss_bytes": 243662848,
+      "median_avg_rss_bytes": 237352823,
+      "peak_python_alloc_bytes": 8371,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "depth": 4,
+      "method": "torch_backward",
+      "mean_time_s": 0.0024173623338962593,
+      "min_time_s": 0.0022016290022293106,
+      "max_time_s": 0.0027177299998584203,
+      "median_peak_rss_bytes": 180080640,
+      "peak_rss_bytes": 180133888,
+      "median_avg_rss_bytes": 180068352,
+      "peak_python_alloc_bytes": 6475,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "depth": 50,
+      "method": "modular_per_parameter",
+      "mean_time_s": 2.127610964666625,
+      "min_time_s": 2.0792101660044864,
+      "max_time_s": 2.1583254899960593,
+      "median_peak_rss_bytes": 270151680,
+      "peak_rss_bytes": 270589952,
+      "median_avg_rss_bytes": 249264202,
+      "peak_python_alloc_bytes": 387570,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "depth": 50,
+      "method": "modular_linear_blocks",
+      "mean_time_s": 1.149907757998638,
+      "min_time_s": 1.1374983159985277,
+      "max_time_s": 1.171005284995772,
+      "median_peak_rss_bytes": 269889536,
+      "peak_rss_bytes": 270024704,
+      "median_avg_rss_bytes": 247266100,
+      "peak_python_alloc_bytes": 381266,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "depth": 50,
+      "method": "backpack_autodiff_linear_blocks",
+      "mean_time_s": 2.251654379334165,
+      "min_time_s": 2.17595799099945,
+      "max_time_s": 2.3006272850034293,
+      "median_peak_rss_bytes": 340357120,
+      "peak_rss_bytes": 340561920,
+      "median_avg_rss_bytes": 308713154,
+      "peak_python_alloc_bytes": 61823,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "depth": 50,
+      "method": "torch_backward",
+      "mean_time_s": 0.027991246667321928,
+      "min_time_s": 0.027586972995777614,
+      "max_time_s": 0.02851791400462389,
+      "median_peak_rss_bytes": 217047040,
+      "peak_rss_bytes": 217255936,
+      "median_avg_rss_bytes": 213525845,
+      "peak_python_alloc_bytes": 46329,
+      "peak_cuda_alloc_bytes": null
+    }
+  ]
+}

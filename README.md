@@ -27,11 +27,12 @@ Current implementation status:
   `Dropout`, `Flatten`, `AvgPool2d`, `AdaptiveAvgPool2d`, `MaxPool2d`, and
   limited `MultiheadAttention`.
 - The eager runtime also accepts an optional `blocks=` partition for the first
-  module-wise milestone. In this first pass, grouped parameters must belong to
-  one supported leaf module in a sequential model, for example a `Linear`
-  module's `weight` and `bias`. Each grouped block shares one local epsilon, so
-  within-module Hessian cross terms are retained while cross-block terms are
-  still ignored.
+  module-wise milestone. Grouped parameters may belong to one supported leaf
+  module in a sequential model, for example a `Linear` module's `weight` and
+  `bias`. Contiguous multi-`Linear` blocks in sequential MLPs are also
+  supported, including the full-MLP block. Each grouped block shares one local
+  epsilon, so within-block Hessian cross terms are retained while cross-block
+  terms are still ignored.
 - The primitive `DualTensor` backend implements the operator-overloading layer
   used by lower-level forward-mode tests and by the current local backward
   tensor programs.
@@ -107,9 +108,9 @@ same block share one local epsilon, so for block `B` the public values are:
 p.hvp = sum_{q in B} H[p, q] v_q
 ```
 
-The current implementation intentionally rejects custom blocks that span
-multiple leaf modules. Larger contiguous sequential blocks and DAG-aware block
-validation are the next graph-scoping step; the primitive `DualTensor` backend
+The current implementation intentionally rejects multi-leaf custom blocks
+outside contiguous sequential Linear MLP spans. DAG-aware custom block
+validation is the next graph-scoping step; the primitive `DualTensor` backend
 does not need to change for that work.
 
 ## Runtime Structure
@@ -351,6 +352,89 @@ mean the method is slower or uses more peak RSS than `modular_hvp`.
 | `backpack_hmp` | 3.725e-09 | 4.425e-07 | 77.740 ms | 1.56x | 368.62 MiB | 1.82x |
 | `backpack_autodiff` | 3.725e-09 | 3.035e-07 | 82.542 ms | 1.66x | 257.10 MiB | 1.27x |
 | `torch_backward` | n/a | n/a | 9.381 ms | 0.19x | 183.14 MiB | 0.91x |
+
+### Linear-Module Block Comparison
+
+The module-wise MLP benchmark groups each `Linear` module's `weight` and `bias`
+into one block, while different `Linear` modules remain separate blocks:
+
+```bash
+uv run python benchmarks/compare_mlp_linear_blocks.py \
+  --depths 4 50 \
+  --batch-size 256 --d-in 784 --d-hidden 256 --d-out 10 \
+  --dtype float32 --warmup 1 --repeats 3
+```
+
+BackPACK HMP is not included in this table because the tested HMP interface
+returns per-parameter Hessian-matrix products and does not directly expose the
+within-module `weight`/`bias` cross terms. BackPACK's reverse-over-reverse
+autodiff utility can do this grouping by passing each module's grouped
+parameters to one `hessian_vector_product(...)` call, so it is the grouped
+baseline below.
+
+For both depths, `modular_linear_blocks` matches grouped reverse-over-reverse,
+while `modular_per_parameter` differs from the grouped reference because it
+intentionally drops the within-Linear `weight`/`bias` cross terms.
+The sequential module-block path applies the downstream curvature action once
+per local block and reuses it for the grouped parameter-gradient formulas, so a
+`weight`/`bias` block does not evaluate the same activation-side curvature
+twice. On the sequential path, grouped parameters also share the same combined
+local tangent reference instead of cloning one identical activation tangent per
+parameter; graph packets still keep independent tensors where values may be
+mutated independently during traversal.
+
+| Hidden Linear/ReLU blocks | Method | Max abs error vs grouped RoR | Max rel error vs grouped RoR | Mean time | Time vs `modular_linear_blocks` | Median peak RSS | Peak RSS vs `modular_linear_blocks` |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | `modular_per_parameter` | 2.230e-01 | 1.361e+00 | 17.089 ms | 1.05x | 177.04 MiB | 1.00x |
+| 4 | `modular_linear_blocks` | 1.863e-09 | 4.091e-07 | 16.284 ms | 1.00x | 176.47 MiB | 1.00x |
+| 4 | `backpack_autodiff_linear_blocks` | 0.000e+00 | 0.000e+00 | 17.082 ms | 1.05x | 229.12 MiB | 1.30x |
+| 4 | `torch_backward` | n/a | n/a | 2.417 ms | 0.15x | 171.74 MiB | 0.97x |
+| 50 | `modular_per_parameter` | 3.155e-01 | 1.143e+00 | 2127.611 ms | 1.85x | 257.64 MiB | 1.00x |
+| 50 | `modular_linear_blocks` | 9.686e-08 | 1.387e-06 | 1149.908 ms | 1.00x | 257.39 MiB | 1.00x |
+| 50 | `backpack_autodiff_linear_blocks` | 0.000e+00 | 0.000e+00 | 2251.654 ms | 1.96x | 324.59 MiB | 1.26x |
+| 50 | `torch_backward` | n/a | n/a | 27.991 ms | 0.02x | 206.99 MiB | 0.80x |
+
+### Full-MLP HVP Comparison
+
+The same block interface can group all sequential MLP parameters into one
+block:
+
+```python
+blocks = {"full": tuple(name for name, _ in model.named_parameters())}
+```
+
+This is mathematically the full Hessian-vector product for the MLP parameters,
+so it is compared against one reverse-over-reverse call over all parameters and
+against PyTorch's `torch.func.jvp(torch.func.grad(...))` baseline:
+
+```bash
+uv run python benchmarks/compare_mlp_full_hvp.py \
+  --depths 4 50 \
+  --batch-size 256 --d-in 784 --d-hidden 256 --d-out 10 \
+  --dtype float32 --warmup 1 --repeats 3
+```
+
+BackPACK RoR is called once with the complete parameter list, not once per
+parameter. The `torch.func` baseline uses detached functional parameters and an
+explicit MSE expression equivalent to `nn.MSELoss(reduction="mean")`; this
+avoids a local torch 2.2 `ZeroTensor` immutability failure in
+`jvp(grad(nn.MSELoss(...)))`.
+
+Full-block results are correct, but they are not the setting where ModularHVP's
+block-scoped advantage is strongest. With one giant block, the problem becomes
+ordinary full-HVP computation, and optimized PyTorch full-HVP baselines are
+competitive or faster on this CPU run.
+
+| Hidden Linear/ReLU blocks | Method | Max abs error vs full RoR | Max rel error vs full RoR | Mean time | Time vs `modular_full` | Median peak RSS | Peak RSS vs `modular_full` |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | `modular_full` | 1.490e-08 | 2.676e-07 | 21.178 ms | 1.00x | 192.04 MiB | 1.00x |
+| 4 | `backpack_autodiff_full` | 0.000e+00 | 0.000e+00 | 16.130 ms | 0.76x | 232.92 MiB | 1.21x |
+| 4 | `torch_func_jvp_full` | 3.725e-08 | 3.568e-07 | 24.044 ms | 1.14x | 249.98 MiB | 1.30x |
+| 4 | `torch_backward` | n/a | n/a | 4.079 ms | 0.19x | 171.84 MiB | 0.89x |
+| 50 | `modular_full` | 1.118e-08 | 1.090e-06 | 271.466 ms | 1.00x | 390.67 MiB | 1.00x |
+| 50 | `backpack_autodiff_full` | 0.000e+00 | 0.000e+00 | 228.550 ms | 0.84x | 375.58 MiB | 0.96x |
+| 50 | `torch_func_jvp_full` | 2.235e-08 | 1.048e-06 | 165.997 ms | 0.61x | 346.02 MiB | 0.89x |
+| 50 | `torch_backward` | n/a | n/a | 37.370 ms | 0.14x | 206.95 MiB | 0.53x |
 
 ## Toy CNN Comparison
 

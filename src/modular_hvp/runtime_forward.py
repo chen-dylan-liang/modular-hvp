@@ -195,6 +195,10 @@ class ForwardRuntimeMixin:
             combined = local_output_tangents[group[0]]
             for group_parameter in group[1:]:
                 combined = combined + local_output_tangents[group_parameter]
+            if not self._use_graph_tensors:
+                for group_parameter in group:
+                    result[group_parameter] = combined
+                continue
             for group_parameter in group:
                 result[group_parameter] = combined.clone(
                     memory_format=torch.preserve_format
@@ -348,7 +352,7 @@ class ForwardRuntimeMixin:
         self._state.active_graph = None
         self._state.curvatures_by_node_id.clear()
         self._state.graph.clear()
-        self._state.use_graph_curvature = False
+        self._state.use_graph_curvature = self._requires_graph_block_scope
         self._state.backward_called = False
         self._state.eager_backward_active = False
         graph_args = self._wrap_graph_input(args) if self._use_graph_tensors else args

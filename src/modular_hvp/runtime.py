@@ -421,6 +421,25 @@ def _resolve_parameter_block_groups(
     }
 
 
+def _has_multi_leaf_parameter_block(
+    model: nn.Module,
+    block_parameters_by_parameter: Mapping[nn.Parameter, tuple[nn.Parameter, ...]],
+) -> bool:
+    """Return whether any custom block spans more than one direct leaf owner."""
+
+    direct_owners = _direct_parameter_owners(model)
+    seen_groups: set[tuple[int, ...]] = set()
+    for group in block_parameters_by_parameter.values():
+        group_key = tuple(id(parameter) for parameter in group)
+        if group_key in seen_groups:
+            continue
+        seen_groups.add(group_key)
+        owners = {direct_owners.get(parameter) for parameter in group}
+        if len(owners) > 1:
+            return True
+    return False
+
+
 def _resolve_block_member_parameter(
     member: str | nn.Parameter,
     *,
@@ -443,7 +462,7 @@ def _validate_first_pass_block_groups(
     block_groups: Iterable[tuple[nn.Parameter, ...]],
     parameter_names_by_id: Mapping[int, str],
 ) -> None:
-    """Validate the first module-wise milestone: one block is one leaf module."""
+    """Validate supported custom block shapes."""
 
     grouped_blocks = [group for group in block_groups if len(group) > 1]
     if not grouped_blocks:
@@ -454,24 +473,27 @@ def _validate_first_pass_block_groups(
             "model or one supported leaf module"
         )
 
-    direct_owners: dict[nn.Parameter, nn.Module] = {}
-    for module in model.modules():
-        for parameter in module.parameters(recurse=False):
-            direct_owners.setdefault(parameter, module)
+    direct_owners = _direct_parameter_owners(model)
+    parameter_order = {
+        parameter: index
+        for index, parameter in enumerate(dict(model.named_parameters()).values())
+    }
 
     for group in grouped_blocks:
         owners = {direct_owners.get(parameter) for parameter in group}
-        if None in owners or len(owners) != 1:
+        if None in owners:
             names = ", ".join(
                 repr(parameter_names_by_id[id(parameter)])
                 for parameter in group
             )
             raise NotImplementedError(
-                "module-wise blocks spanning multiple leaf modules are not implemented "
+                "custom module-wise blocks require directly owned parameters; "
                 f"in the sequential first pass; got block {names}"
             )
-        owner = next(iter(owners))
-        if not _is_supported_leaf_module(owner):
+        if len(owners) == 1:
+            owner = next(iter(owners))
+            if _is_supported_leaf_module(owner):
+                continue
             names = ", ".join(
                 repr(parameter_names_by_id[id(parameter)])
                 for parameter in group
@@ -480,6 +502,42 @@ def _validate_first_pass_block_groups(
                 "custom module-wise blocks currently require grouped parameters to "
                 f"belong to one supported leaf module; got block {names}"
             )
+        if not _can_use_sequential_fast_path(model):
+            names = ", ".join(
+                repr(parameter_names_by_id[id(parameter)])
+                for parameter in group
+            )
+            raise NotImplementedError(
+                "blocks spanning multiple leaf modules currently require a supported "
+                f"nn.Sequential model; got block {names}"
+            )
+        if not all(isinstance(owner, nn.Linear) for owner in owners):
+            names = ", ".join(
+                repr(parameter_names_by_id[id(parameter)])
+                for parameter in group
+            )
+            raise NotImplementedError(
+                "blocks spanning multiple leaf modules are currently supported only "
+                f"for sequential Linear MLPs; got block {names}"
+            )
+        positions = sorted(parameter_order[parameter] for parameter in group)
+        if positions != list(range(positions[0], positions[-1] + 1)):
+            names = ", ".join(
+                repr(parameter_names_by_id[id(parameter)])
+                for parameter in group
+            )
+            raise NotImplementedError(
+                "blocks spanning multiple leaf modules must form a contiguous "
+                f"parameter span in the sequential model; got block {names}"
+            )
+
+
+def _direct_parameter_owners(model: nn.Module) -> dict[nn.Parameter, nn.Module]:
+    direct_owners: dict[nn.Parameter, nn.Module] = {}
+    for module in model.modules():
+        for parameter in module.parameters(recurse=False):
+            direct_owners.setdefault(parameter, module)
+    return direct_owners
 
 
 def _validate_tangent(

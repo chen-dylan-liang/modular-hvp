@@ -1,0 +1,146 @@
+{
+  "config": {
+    "depths": [
+      4,
+      50
+    ],
+    "seed": 0,
+    "batch_size": 256,
+    "d_in": 784,
+    "d_hidden": 256,
+    "d_out": 10,
+    "dtype": "float32",
+    "device": "cpu",
+    "warmup": 1,
+    "repeats": 3,
+    "rss_sample_interval_ms": 1.0
+  },
+  "comparisons": {
+    "4": {
+      "modular_full": {
+        "max_abs": 1.4901161193847656e-08,
+        "max_rel": 2.67603516832603e-07
+      },
+      "backpack_autodiff_full": {
+        "max_abs": 0.0,
+        "max_rel": 0.0
+      },
+      "torch_func_jvp_full": {
+        "max_abs": 3.725290298461914e-08,
+        "max_rel": 3.5680468911013735e-07
+      }
+    },
+    "50": {
+      "modular_full": {
+        "max_abs": 1.1175870895385742e-08,
+        "max_rel": 1.089614206691733e-06
+      },
+      "backpack_autodiff_full": {
+        "max_abs": 0.0,
+        "max_rel": 0.0
+      },
+      "torch_func_jvp_full": {
+        "max_abs": 2.2351741790771484e-08,
+        "max_rel": 1.0483501173376273e-06
+      }
+    }
+  },
+  "records": [
+    {
+      "depth": 4,
+      "method": "modular_full",
+      "mean_time_s": 0.021177510667863924,
+      "min_time_s": 0.020208791000186466,
+      "max_time_s": 0.021844066999619827,
+      "median_peak_rss_bytes": 201367552,
+      "peak_rss_bytes": 208080896,
+      "median_avg_rss_bytes": 196623952,
+      "peak_python_alloc_bytes": 35256,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "depth": 4,
+      "method": "backpack_autodiff_full",
+      "mean_time_s": 0.0161296936639701,
+      "min_time_s": 0.0137323069939157,
+      "max_time_s": 0.02013987099780934,
+      "median_peak_rss_bytes": 244236288,
+      "peak_rss_bytes": 248733696,
+      "median_avg_rss_bytes": 238907977,
+      "peak_python_alloc_bytes": 9155,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "depth": 4,
+      "method": "torch_func_jvp_full",
+      "mean_time_s": 0.02404395633251018,
+      "min_time_s": 0.02179610700113699,
+      "max_time_s": 0.025899084997945465,
+      "median_peak_rss_bytes": 262123520,
+      "peak_rss_bytes": 262414336,
+      "median_avg_rss_bytes": 256949194,
+      "peak_python_alloc_bytes": 31928,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "depth": 4,
+      "method": "torch_backward",
+      "mean_time_s": 0.004079134666729563,
+      "min_time_s": 0.0034507660020608455,
+      "max_time_s": 0.004598926992912311,
+      "median_peak_rss_bytes": 180191232,
+      "peak_rss_bytes": 180232192,
+      "median_avg_rss_bytes": 180179763,
+      "peak_python_alloc_bytes": 6475,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "depth": 50,
+      "method": "modular_full",
+      "mean_time_s": 0.27146611199956777,
+      "min_time_s": 0.2624426519978442,
+      "max_time_s": 0.27897895199566847,
+      "median_peak_rss_bytes": 409645056,
+      "peak_rss_bytes": 477691904,
+      "median_avg_rss_bytes": 374244919,
+      "peak_python_alloc_bytes": 383962,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "depth": 50,
+      "method": "backpack_autodiff_full",
+      "mean_time_s": 0.22854971466828525,
+      "min_time_s": 0.2257261750055477,
+      "max_time_s": 0.23280541400163202,
+      "median_peak_rss_bytes": 393826304,
+      "peak_rss_bytes": 394383360,
+      "median_avg_rss_bytes": 337295083,
+      "peak_python_alloc_bytes": 67217,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "depth": 50,
+      "method": "torch_func_jvp_full",
+      "mean_time_s": 0.1659971276676515,
+      "min_time_s": 0.16034318300080486,
+      "max_time_s": 0.16893248099950142,
+      "median_peak_rss_bytes": 362823680,
+      "peak_rss_bytes": 363249664,
+      "median_avg_rss_bytes": 319405464,
+      "peak_python_alloc_bytes": 143435,
+      "peak_cuda_alloc_bytes": null
+    },
+    {
+      "depth": 50,
+      "method": "torch_backward",
+      "mean_time_s": 0.03737037766889747,
+      "min_time_s": 0.03603622400260065,
+      "max_time_s": 0.03902236000431003,
+      "median_peak_rss_bytes": 216997888,
+      "peak_rss_bytes": 217092096,
+      "median_avg_rss_bytes": 212942055,
+      "peak_python_alloc_bytes": 46329,
+      "peak_cuda_alloc_bytes": null
+    }
+  ]
+}

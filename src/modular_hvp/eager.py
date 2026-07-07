@@ -17,7 +17,11 @@ from modular_hvp.model_utils import (
     _parameter_use_counts,
     _validate_supported_model,
 )
-from modular_hvp.runtime import _resolve_parameter_block_groups, _resolve_parameter_blocks
+from modular_hvp.runtime import (
+    _has_multi_leaf_parameter_block,
+    _resolve_parameter_block_groups,
+    _resolve_parameter_blocks,
+)
 from modular_hvp.runtime_backward import BackwardRuntimeMixin
 from modular_hvp.runtime_dispatch import GraphDispatchMixin
 from modular_hvp.runtime_forward import ForwardRuntimeMixin
@@ -62,12 +66,22 @@ class EagerHVPRuntime(ForwardRuntimeMixin, GraphDispatchMixin, BackwardRuntimeMi
         self._tangents_by_parameter = {
             block.parameter: block.tangent for block in self.parameter_blocks
         }
+        self._block_channel_by_parameter = {
+            parameter: group[0]
+            for parameter, group in self._block_parameters_by_parameter.items()
+        }
         self._parameter_use_counts = _parameter_use_counts(model)
         self._has_reused_parameters = any(
             count > 1 for count in self._parameter_use_counts.values()
         )
+        self._requires_graph_block_scope = _has_multi_leaf_parameter_block(
+            model,
+            self._block_parameters_by_parameter,
+        )
         self._use_graph_tensors = (
-            self._has_reused_parameters or not _can_use_sequential_fast_path(model)
+            self._has_reused_parameters
+            or self._requires_graph_block_scope
+            or not _can_use_sequential_fast_path(model)
         )
         self._raw_graph_parameters = (
             _iter_raw_graph_parameters(model) if self._use_graph_tensors else ()

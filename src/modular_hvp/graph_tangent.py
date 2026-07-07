@@ -1095,19 +1095,25 @@ def _propagate_backward_tangent_packet_with_grad(
     forward_tangents_by_node: Mapping[int, Mapping[nn.Parameter, torch.Tensor]],
     grad_tangents_by_node: dict[int, dict[nn.Parameter, torch.Tensor]],
     parameter_tangents: Mapping[nn.Parameter, torch.Tensor],
+    block_channel_by_parameter: Mapping[nn.Parameter, nn.Parameter] | None = None,
 ) -> None:
     if isinstance(record, LinearForwardRecord):
         weight = record.module.weight.detach()
         input_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
         parameters = set(output_grad_tangents)
+        weight_channel = (
+            block_channel_by_parameter.get(record.module.weight, record.module.weight)
+            if block_channel_by_parameter is not None
+            else record.module.weight
+        )
         if record.module.weight is not None:
-            parameters.add(record.module.weight)
+            parameters.add(weight_channel)
         for parameter in parameters:
             value = None
             grad_tangent = output_grad_tangents.get(parameter)
             if grad_tangent is not None:
                 value = _linear_input_backward_program(weight, grad_tangent)
-            if parameter is record.module.weight:
+            if parameter is weight_channel:
                 weight_tangent = parameter_tangents.get(record.module.weight)
                 if weight_tangent is not None:
                     term = _linear_input_backward_program(weight_tangent, grad)
@@ -1121,13 +1127,24 @@ def _propagate_backward_tangent_packet_with_grad(
         input_packet = grad_tangents_by_node.setdefault(record.input_node_id, {})
         parameters = set(output_grad_tangents)
         if isinstance(record.weight, nn.Parameter):
-            parameters.add(record.weight)
+            weight_channel = (
+                block_channel_by_parameter.get(record.weight, record.weight)
+                if block_channel_by_parameter is not None
+                else record.weight
+            )
+            parameters.add(weight_channel)
+        else:
+            weight_channel = None
         for parameter in parameters:
             value = None
             grad_tangent = output_grad_tangents.get(parameter)
             if grad_tangent is not None:
                 value = _linear_input_backward_program(weight, grad_tangent)
-            if parameter is record.weight and isinstance(record.weight, nn.Parameter):
+            if (
+                weight_channel is not None
+                and parameter is weight_channel
+                and isinstance(record.weight, nn.Parameter)
+            ):
                 weight_tangent = parameter_tangents.get(record.weight)
                 if weight_tangent is not None:
                     term = _linear_input_backward_program(weight_tangent, grad)

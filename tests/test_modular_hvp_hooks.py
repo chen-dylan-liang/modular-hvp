@@ -647,6 +647,39 @@ def test_linear_module_blocks_keep_within_module_cross_terms() -> None:
         assert torch.allclose(parameter.hvp, module_hvps[name], rtol=1e-10, atol=1e-10)
 
 
+def test_modular_hvp_supports_full_block_on_sequential_mlp() -> None:
+    torch.manual_seed(44)
+    baseline = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2)).double()
+    model = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2)).double()
+    model.load_state_dict(baseline.state_dict())
+
+    x = torch.randn(5, 3, dtype=torch.float64)
+    target = torch.randn(5, 2, dtype=torch.float64)
+    criterion = nn.MSELoss()
+    tangents = {
+        name: torch.randn_like(parameter)
+        for name, parameter in model.named_parameters()
+    }
+    block_names = tuple(name for name, _ in model.named_parameters())
+    blocks = {"full": block_names}
+
+    reference_hvps = _custom_block_autodiff_hvps(
+        baseline,
+        criterion,
+        x,
+        target,
+        tangents,
+        blocks,
+    )
+    with modular_hvp(model, tangents, blocks=blocks):
+        loss = criterion(model(x), target)
+        loss.backward()
+
+    for name, parameter in model.named_parameters():
+        assert parameter.hvp is not None
+        assert torch.allclose(parameter.hvp, reference_hvps[name], rtol=1e-10, atol=1e-10)
+
+
 def test_default_modular_hvp_matches_block_autodiff_on_sequential_cnn() -> None:
     torch.manual_seed(20)
     baseline = nn.Sequential(

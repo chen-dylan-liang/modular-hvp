@@ -10,7 +10,6 @@ from torch import nn
 
 from modular_hvp.graph import (
     RecordedForwardGraph,
-    _local_parameter_use_counts,
     _record_has_backward_nonlinearity_tangents,
     _take_graph_local_parameters_by_output_node,
 )
@@ -103,9 +102,16 @@ class BackwardRuntimeMixin:
                 graph = RecordedForwardGraph.from_records(
                     records=self._state.forward_records,
                     output_node_id=self._state.output_node_id,
-                    retain_local_parameter_inputs=self._has_reused_parameters,
+                    retain_local_parameter_inputs=(
+                        self._has_reused_parameters
+                        or self._requires_graph_block_scope
+                    ),
                 )
-                if graph.requires_hooked_primal_grads or self._has_reused_parameters:
+                if (
+                    graph.requires_hooked_primal_grads
+                    or self._has_reused_parameters
+                    or self._requires_graph_block_scope
+                ):
                     self._state.active_graph = graph
                     self._initialize_graph_hvp_hook_state(graph)
                     self._state.loss_record = None
@@ -272,8 +278,8 @@ class BackwardRuntimeMixin:
             output_grad_tangents=output_grad_tangents,
             retained_forward_tangents_by_node=tangents_by_node,
             local_parameters_by_output_node=local_parameters_by_output_node,
-            remaining_local_uses_by_parameter=_local_parameter_use_counts(
-                local_parameters_by_output_node
+            remaining_local_uses_by_parameter=self._local_channel_use_counts(
+                local_parameters_by_output_node,
             ),
             input_use_counts=graph.fresh_input_use_counts(),
         )
@@ -287,7 +293,7 @@ class BackwardRuntimeMixin:
         retained_node_ids: set[int] | frozenset[int] | None = None,
     ) -> dict[int, dict[nn.Parameter, torch.Tensor]]:
         tangents_by_node: dict[int, dict[nn.Parameter, torch.Tensor]] = {
-            node_id: packet.copy()
+            node_id: self._parameter_packet_to_channel_packet(packet)
             for node_id, packet in self._state.raw_parameter_tangents_by_node.items()
         }
         retained_tangents_by_node: dict[int, dict[nn.Parameter, torch.Tensor]] = {}
@@ -311,10 +317,12 @@ class BackwardRuntimeMixin:
             if local_tangents:
                 if record_tangents is None:
                     record_tangents = {}
-                for parameter, tangent_value in local_tangents.items():
+                for channel, tangent_value in self._local_tangent_channel_packet(
+                    local_tangents,
+                ).items():
                     _accumulate_parameter_tensor(
                         record_tangents,
-                        parameter,
+                        channel,
                         tangent_value,
                     )
             if record_tangents:
@@ -367,9 +375,9 @@ class BackwardRuntimeMixin:
                 primal_grad=graph_state.primal_grad(record),
                 forward_tangents_by_node=graph_state.forward_tangents_by_node,
             )
-            for parameter in local_parameters:
-                if graph_state.consume_local_parameter_use(parameter) == 0:
-                    output_grad_tangents.pop(parameter, None)
+            for channel in self._local_channels_for_parameters(local_parameters):
+                if graph_state.consume_local_parameter_use(channel) == 0:
+                    output_grad_tangents.pop(channel, None)
 
             if output_grad_tangents or _record_has_backward_nonlinearity_tangents(
                 record,
@@ -382,6 +390,7 @@ class BackwardRuntimeMixin:
                     graph_state.forward_tangents_by_node,
                     graph_state.grad_tangents_by_node,
                     self._tangents_by_parameter,
+                    self._block_channel_by_parameter,
                 )
 
             graph_state.finish_record(graph, record)
@@ -400,7 +409,7 @@ class BackwardRuntimeMixin:
             raise RuntimeError("graph HVP requested before loss initialization")
 
         tangents_by_node: dict[int, dict[nn.Parameter, torch.Tensor]] = {
-            node_id: packet.copy()
+            node_id: self._parameter_packet_to_channel_packet(packet)
             for node_id, packet in self._state.raw_parameter_tangents_by_node.items()
         }
         remaining_input_uses = graph.fresh_input_use_counts()
@@ -419,10 +428,12 @@ class BackwardRuntimeMixin:
             if local_tangents:
                 if record_tangents is None:
                     record_tangents = {}
-                for parameter, tangent_value in local_tangents.items():
+                for channel, tangent_value in self._local_tangent_channel_packet(
+                    local_tangents,
+                ).items():
                     _accumulate_parameter_tensor(
                         record_tangents,
-                        parameter,
+                        channel,
                         tangent_value,
                     )
             if record_tangents:
@@ -446,6 +457,16 @@ class BackwardRuntimeMixin:
             }
         }
 
+        local_parameters_by_output_node = {
+            _record_output_node_id(record): tuple(_record_local_output_tangents(record))
+            for record in graph.records
+            if _record_local_output_tangents(record)
+        }
+        remaining_local_uses_by_channel = self._local_channel_use_counts(
+            local_parameters_by_output_node,
+        )
+        self._state.graph.local_parameters_by_output_node = local_parameters_by_output_node
+
         for record in graph.reverse_records:
             output_grad_tangents = grad_tangents_by_node.pop(
                 _record_output_node_id(record),
@@ -455,10 +476,15 @@ class BackwardRuntimeMixin:
                 _record_local_output_tangents(record).clear()
                 continue
 
-            local_parameters = tuple(_record_local_output_tangents(record))
+            local_parameters = self._state.graph.local_parameters_for(record)
             self._accumulate_graph_record_hvps(record, output_grad_tangents)
-            for parameter in local_parameters:
-                output_grad_tangents.pop(parameter, None)
+            for channel in self._local_channels_for_parameters(local_parameters):
+                remaining = remaining_local_uses_by_channel.get(channel, 0)
+                if remaining <= 1:
+                    remaining_local_uses_by_channel.pop(channel, None)
+                    output_grad_tangents.pop(channel, None)
+                else:
+                    remaining_local_uses_by_channel[channel] = remaining - 1
             if not output_grad_tangents:
                 continue
 
@@ -473,6 +499,56 @@ class BackwardRuntimeMixin:
         for block in self.parameter_blocks:
             if getattr(block.parameter, "hvp", None) is None:
                 setattr(block.parameter, "hvp", torch.zeros_like(block.parameter))
+        self._state.graph.local_parameters_by_output_node.clear()
+
+    def _parameter_packet_to_channel_packet(
+        self,
+        packet: Mapping[nn.Parameter, torch.Tensor],
+    ) -> dict[nn.Parameter, torch.Tensor]:
+        channel_packet: dict[nn.Parameter, torch.Tensor] = {}
+        for parameter, tangent_value in packet.items():
+            _accumulate_parameter_tensor(
+                channel_packet,
+                self._block_channel_by_parameter[parameter],
+                tangent_value,
+            )
+        return channel_packet
+
+    def _local_tangent_channel_packet(
+        self,
+        local_tangents: Mapping[nn.Parameter, torch.Tensor],
+    ) -> dict[nn.Parameter, torch.Tensor]:
+        channel_packet: dict[nn.Parameter, torch.Tensor] = {}
+        for parameter, tangent_value in local_tangents.items():
+            channel = self._block_channel_by_parameter[parameter]
+            if channel in channel_packet:
+                continue
+            channel_packet[channel] = tangent_value
+        return channel_packet
+
+    def _local_channel_use_counts(
+        self,
+        local_parameters_by_output_node: Mapping[int, tuple[nn.Parameter, ...]],
+    ) -> dict[nn.Parameter, int]:
+        counts: dict[nn.Parameter, int] = {}
+        for parameters in local_parameters_by_output_node.values():
+            for channel in self._local_channels_for_parameters(parameters):
+                counts[channel] = counts.get(channel, 0) + 1
+        return counts
+
+    def _local_channels_for_parameters(
+        self,
+        parameters: tuple[nn.Parameter, ...],
+    ) -> tuple[nn.Parameter, ...]:
+        channels: list[nn.Parameter] = []
+        seen: set[nn.Parameter] = set()
+        for parameter in parameters:
+            channel = self._block_channel_by_parameter[parameter]
+            if channel in seen:
+                continue
+            seen.add(channel)
+            channels.append(channel)
+        return tuple(channels)
 
     def _accumulate_raw_parameter_graph_hvps(
         self,
@@ -481,7 +557,7 @@ class BackwardRuntimeMixin:
         for node_id, local_packet in self._state.raw_parameter_tangents_by_node.items():
             output_packet = grad_tangents_by_node.pop(node_id, {})
             for parameter in local_packet:
-                hvp = output_packet.get(parameter)
+                hvp = output_packet.get(self._block_channel_by_parameter[parameter])
                 if hvp is not None:
                     self._accumulate_hvp(parameter, hvp)
 
@@ -502,10 +578,11 @@ class BackwardRuntimeMixin:
             if isinstance(record, LinearForwardRecord):
                 input_activation = record.input_activation.resolve_and_release().detach()
                 for parameter in local_parameters:
-                    grad_tangent = output_grad_tangents.get(parameter)
+                    channel = self._block_channel_by_parameter[parameter]
+                    grad_tangent = output_grad_tangents.get(channel)
                     input_tangent = _local_record_input_tangent(
                         record,
-                        parameter,
+                        channel,
                         forward_tangents_by_node,
                     )
                     if parameter is record.module.weight:
@@ -533,7 +610,8 @@ class BackwardRuntimeMixin:
 
             if isinstance(record, EmbeddingForwardRecord):
                 for parameter in local_parameters:
-                    grad_tangent = output_grad_tangents.get(parameter)
+                    channel = self._block_channel_by_parameter[parameter]
+                    grad_tangent = output_grad_tangents.get(channel)
                     if grad_tangent is None:
                         hvp = torch.zeros_like(parameter)
                     elif parameter is record.module.weight:
@@ -550,10 +628,11 @@ class BackwardRuntimeMixin:
             if isinstance(record, FunctionalLinearForwardRecord):
                 input_activation = record.input_activation.resolve_and_release().detach()
                 for parameter in local_parameters:
-                    grad_tangent = output_grad_tangents.get(parameter)
+                    channel = self._block_channel_by_parameter[parameter]
+                    grad_tangent = output_grad_tangents.get(channel)
                     input_tangent = _local_record_input_tangent(
                         record,
-                        parameter,
+                        channel,
                         forward_tangents_by_node,
                     )
                     if parameter is record.weight:
@@ -582,7 +661,8 @@ class BackwardRuntimeMixin:
             if isinstance(record, Conv2dForwardRecord):
                 input_activation = record.input_activation.resolve_and_release().detach()
                 for parameter in local_parameters:
-                    grad_tangent = output_grad_tangents.get(parameter)
+                    channel = self._block_channel_by_parameter[parameter]
+                    grad_tangent = output_grad_tangents.get(channel)
                     if grad_tangent is None:
                         hvp = torch.zeros_like(parameter)
                     elif parameter is record.module.weight:
@@ -601,7 +681,8 @@ class BackwardRuntimeMixin:
             if isinstance(record, BatchNorm2dForwardRecord):
                 input_activation = record.input_activation.resolve_and_release().detach()
                 for parameter in local_parameters:
-                    grad_tangent = output_grad_tangents.get(parameter)
+                    channel = self._block_channel_by_parameter[parameter]
+                    grad_tangent = output_grad_tangents.get(channel)
                     if grad_tangent is None:
                         hvp = torch.zeros_like(parameter)
                     elif parameter is record.module.weight:
@@ -624,7 +705,8 @@ class BackwardRuntimeMixin:
                     input_activation,
                 )
                 for parameter in local_parameters:
-                    grad_tangent = output_grad_tangents.get(parameter)
+                    channel = self._block_channel_by_parameter[parameter]
+                    grad_tangent = output_grad_tangents.get(channel)
                     if grad_tangent is None:
                         hvp = torch.zeros_like(parameter)
                     elif parameter is record.module.weight:
@@ -653,7 +735,8 @@ class BackwardRuntimeMixin:
                     rstd,
                 )
                 for parameter in local_parameters:
-                    grad_tangent = output_grad_tangents.get(parameter)
+                    channel = self._block_channel_by_parameter[parameter]
+                    grad_tangent = output_grad_tangents.get(channel)
                     if grad_tangent is None:
                         hvp = torch.zeros_like(parameter)
                     elif parameter is record.weight:
@@ -686,6 +769,28 @@ class BackwardRuntimeMixin:
     ) -> tuple[nn.Parameter, ...]:
         return self._state.graph.local_parameters_for(record)
 
+    def _local_curvature_tangent_groups(
+        self,
+        record: ForwardRecord,
+        curvature: Callable[[torch.Tensor], torch.Tensor],
+    ) -> tuple[tuple[tuple[nn.Parameter, ...], torch.Tensor], ...]:
+        """Apply downstream curvature once per local block in a record."""
+
+        local_tangents = _record_local_output_tangents(record)
+        groups: list[tuple[tuple[nn.Parameter, ...], torch.Tensor]] = []
+        handled: set[nn.Parameter] = set()
+        for parameter, local_output_tangent in local_tangents.items():
+            if parameter in handled:
+                continue
+            block_group = tuple(
+                group_parameter
+                for group_parameter in self._block_parameters_by_parameter[parameter]
+                if group_parameter in local_tangents
+            )
+            handled.update(block_group)
+            groups.append((block_group, curvature(local_output_tangent)))
+        return tuple(groups)
+
     def _consume_embedding_backward_record(
         self,
         *,
@@ -695,17 +800,20 @@ class BackwardRuntimeMixin:
         if curvature is None:
             raise RuntimeError("missing output curvature for Embedding backward hook")
         try:
-            for parameter, local_output_tangent in record.local_output_tangents.items():
-                parameter_grad_tangent = curvature(local_output_tangent)
-                if parameter is record.module.weight:
-                    hvp = _embedding_weight_backward_program(
-                        record.module,
-                        record.indices,
-                        parameter_grad_tangent,
-                    )
-                else:
-                    raise RuntimeError("local dual activation belongs to wrong module")
-                self._accumulate_hvp(parameter, hvp)
+            for parameters, parameter_grad_tangent in self._local_curvature_tangent_groups(
+                record,
+                curvature,
+            ):
+                for parameter in parameters:
+                    if parameter is record.module.weight:
+                        hvp = _embedding_weight_backward_program(
+                            record.module,
+                            record.indices,
+                            parameter_grad_tangent,
+                        )
+                    else:
+                        raise RuntimeError("local dual activation belongs to wrong module")
+                    self._accumulate_hvp(parameter, hvp)
         finally:
             record.local_output_tangents.clear()
 
@@ -720,18 +828,21 @@ class BackwardRuntimeMixin:
             raise RuntimeError("missing output curvature for Linear backward hook")
         input_activation = record.input_activation.resolve_and_release().detach()
         try:
-            for parameter, local_output_tangent in record.local_output_tangents.items():
-                parameter_grad_tangent = curvature(local_output_tangent)
-                if parameter is record.module.weight:
-                    hvp = _linear_weight_backward_program(
-                        input_activation,
-                        parameter_grad_tangent,
-                    )
-                elif parameter is record.module.bias:
-                    hvp = _linear_bias_backward_program(parameter_grad_tangent)
-                else:
-                    raise RuntimeError("local dual activation belongs to wrong module")
-                self._accumulate_hvp(parameter, hvp)
+            for parameters, parameter_grad_tangent in self._local_curvature_tangent_groups(
+                record,
+                curvature,
+            ):
+                for parameter in parameters:
+                    if parameter is record.module.weight:
+                        hvp = _linear_weight_backward_program(
+                            input_activation,
+                            parameter_grad_tangent,
+                        )
+                    elif parameter is record.module.bias:
+                        hvp = _linear_bias_backward_program(parameter_grad_tangent)
+                    else:
+                        raise RuntimeError("local dual activation belongs to wrong module")
+                    self._accumulate_hvp(parameter, hvp)
         finally:
             record.local_output_tangents.clear()
 
@@ -754,19 +865,22 @@ class BackwardRuntimeMixin:
             raise RuntimeError("missing output curvature for Conv2d backward hook")
         input_activation = record.input_activation.resolve_and_release().detach()
         try:
-            for parameter, local_output_tangent in record.local_output_tangents.items():
-                parameter_grad_tangent = curvature(local_output_tangent)
-                if parameter is record.module.weight:
-                    hvp = _conv2d_weight_backward_program(
-                        record.module,
-                        input_activation,
-                        parameter_grad_tangent,
-                    )
-                elif parameter is record.module.bias:
-                    hvp = _conv2d_bias_backward_program(parameter_grad_tangent)
-                else:
-                    raise RuntimeError("local dual activation belongs to wrong module")
-                self._accumulate_hvp(parameter, hvp)
+            for parameters, parameter_grad_tangent in self._local_curvature_tangent_groups(
+                record,
+                curvature,
+            ):
+                for parameter in parameters:
+                    if parameter is record.module.weight:
+                        hvp = _conv2d_weight_backward_program(
+                            record.module,
+                            input_activation,
+                            parameter_grad_tangent,
+                        )
+                    elif parameter is record.module.bias:
+                        hvp = _conv2d_bias_backward_program(parameter_grad_tangent)
+                    else:
+                        raise RuntimeError("local dual activation belongs to wrong module")
+                    self._accumulate_hvp(parameter, hvp)
         finally:
             record.local_output_tangents.clear()
 
@@ -790,19 +904,22 @@ class BackwardRuntimeMixin:
             raise RuntimeError("missing output curvature for BatchNorm2d backward hook")
         input_activation = record.input_activation.resolve_and_release().detach()
         try:
-            for parameter, local_output_tangent in record.local_output_tangents.items():
-                parameter_grad_tangent = curvature(local_output_tangent)
-                if parameter is record.module.weight:
-                    hvp = _batch_norm2d_weight_backward_program(
-                        record.module,
-                        input_activation,
-                        parameter_grad_tangent,
-                    )
-                elif parameter is record.module.bias:
-                    hvp = _batch_norm2d_bias_backward_program(parameter_grad_tangent)
-                else:
-                    raise RuntimeError("local dual activation belongs to wrong module")
-                self._accumulate_hvp(parameter, hvp)
+            for parameters, parameter_grad_tangent in self._local_curvature_tangent_groups(
+                record,
+                curvature,
+            ):
+                for parameter in parameters:
+                    if parameter is record.module.weight:
+                        hvp = _batch_norm2d_weight_backward_program(
+                            record.module,
+                            input_activation,
+                            parameter_grad_tangent,
+                        )
+                    elif parameter is record.module.bias:
+                        hvp = _batch_norm2d_bias_backward_program(parameter_grad_tangent)
+                    else:
+                        raise RuntimeError("local dual activation belongs to wrong module")
+                    self._accumulate_hvp(parameter, hvp)
         finally:
             record.local_output_tangents.clear()
 
@@ -827,22 +944,25 @@ class BackwardRuntimeMixin:
         input_activation = record.input_activation.resolve().detach()
         normalized_input = _layer_norm_normalized_input(record.module, input_activation)
         try:
-            for parameter, local_output_tangent in record.local_output_tangents.items():
-                parameter_grad_tangent = curvature(local_output_tangent)
-                if parameter is record.module.weight:
-                    hvp = _layer_norm_weight_backward_program(
-                        normalized_input,
-                        parameter_grad_tangent,
-                        parameter.shape,
-                    )
-                elif parameter is record.module.bias:
-                    hvp = _layer_norm_bias_backward_program(
-                        parameter_grad_tangent,
-                        parameter.shape,
-                    )
-                else:
-                    raise RuntimeError("local dual activation belongs to wrong module")
-                self._accumulate_hvp(parameter, hvp)
+            for parameters, parameter_grad_tangent in self._local_curvature_tangent_groups(
+                record,
+                curvature,
+            ):
+                for parameter in parameters:
+                    if parameter is record.module.weight:
+                        hvp = _layer_norm_weight_backward_program(
+                            normalized_input,
+                            parameter_grad_tangent,
+                            parameter.shape,
+                        )
+                    elif parameter is record.module.bias:
+                        hvp = _layer_norm_bias_backward_program(
+                            parameter_grad_tangent,
+                            parameter.shape,
+                        )
+                    else:
+                        raise RuntimeError("local dual activation belongs to wrong module")
+                    self._accumulate_hvp(parameter, hvp)
         finally:
             record.local_output_tangents.clear()
 
