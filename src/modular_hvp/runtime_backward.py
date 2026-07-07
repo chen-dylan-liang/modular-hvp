@@ -109,26 +109,29 @@ class BackwardRuntimeMixin:
                     same_block_input_node_ids_by_channel = (
                         self._validate_custom_blocks_on_recorded_graph()
                     )
+                for channel, node_ids in (
+                    self._reused_local_input_tangent_node_ids_by_channel().items()
+                ):
+                    same_block_input_node_ids_by_channel.setdefault(
+                        channel,
+                        set(),
+                    ).update(node_ids)
                 self._state.same_block_input_tangent_node_ids_by_channel = (
                     same_block_input_node_ids_by_channel
                 )
-                extra_retained_node_ids: set[int] = set()
-                for node_ids in same_block_input_node_ids_by_channel.values():
-                    extra_retained_node_ids.update(node_ids)
                 graph = RecordedForwardGraph.from_records(
                     records=self._state.forward_records,
                     output_node_id=self._state.output_node_id,
-                    retain_local_parameter_inputs=self._has_reused_parameters,
-                    extra_retained_forward_tangent_node_ids=extra_retained_node_ids,
+                    extra_retained_forward_tangent_channels_by_node=(
+                        self._retained_forward_tangent_channels_by_node(
+                            same_block_input_node_ids_by_channel,
+                        )
+                    ),
                 )
                 requires_same_block_input_jvp = bool(
                     same_block_input_node_ids_by_channel
                 )
-                if (
-                    graph.requires_hooked_primal_grads
-                    or self._has_reused_parameters
-                    or requires_same_block_input_jvp
-                ):
+                if graph.requires_hooked_primal_grads or requires_same_block_input_jvp:
                     self._state.active_graph = graph
                     self._state.eager_backward_active = True
                     self._initialize_graph_hvp_hook_state(graph)
@@ -166,6 +169,36 @@ class BackwardRuntimeMixin:
             channel = self._block_channel_by_parameter[parameter]
             retained_by_channel.setdefault(channel, set()).update(node_ids)
         return retained_by_channel
+
+    def _reused_local_input_tangent_node_ids_by_channel(
+        self,
+    ) -> dict[nn.Parameter, set[int]]:
+        if not self._reused_block_channels:
+            return {}
+        retained_by_channel: dict[nn.Parameter, set[int]] = {}
+        for record in self._state.forward_records:
+            local_channels = self._local_channels_for_parameters(
+                tuple(_record_local_output_tangents(record)),
+            )
+            reused_local_channels = set(local_channels) & self._reused_block_channels
+            if not reused_local_channels:
+                continue
+            input_node_ids = _record_input_node_ids(record)
+            if not input_node_ids:
+                continue
+            for channel in reused_local_channels:
+                retained_by_channel.setdefault(channel, set()).update(input_node_ids)
+        return retained_by_channel
+
+    def _retained_forward_tangent_channels_by_node(
+        self,
+        node_ids_by_channel: Mapping[nn.Parameter, set[int]],
+    ) -> dict[int, set[nn.Parameter]]:
+        retained_by_node: dict[int, set[nn.Parameter]] = {}
+        for channel, node_ids in node_ids_by_channel.items():
+            for node_id in node_ids:
+                retained_by_node.setdefault(node_id, set()).add(channel)
+        return retained_by_node
 
     def _take_node_curvature(
         self,
@@ -229,7 +262,11 @@ class BackwardRuntimeMixin:
             return True
         if not self._state.use_graph_curvature:
             return True
-        if self._has_reused_parameters:
+        if set(
+            self._local_channels_for_parameters(
+                tuple(_record_local_output_tangents(record)),
+            ),
+        ) & self._reused_block_channels:
             return True
         if isinstance(
             record,
@@ -404,10 +441,29 @@ class BackwardRuntimeMixin:
             for node_id, packet in self._state.raw_parameter_tangents_by_node.items()
         }
         retained_tangents_by_node: dict[int, dict[nn.Parameter, torch.Tensor]] = {}
+        retained_channels_by_node = graph.retained_forward_tangent_channels_by_node
+
+        def retain_packet_if_needed(
+            node_id: int,
+            packet: dict[nn.Parameter, torch.Tensor],
+        ) -> None:
+            if retained_node_ids is None or node_id not in retained_node_ids:
+                return
+            retained_channels = retained_channels_by_node.get(node_id)
+            if retained_channels is None:
+                retained_tangents_by_node[node_id] = packet
+                return
+            filtered_packet = {
+                channel: tangent_value
+                for channel, tangent_value in packet.items()
+                if channel in retained_channels
+            }
+            if filtered_packet:
+                retained_tangents_by_node[node_id] = filtered_packet
+
         if retained_node_ids is not None:
             for node_id, packet in tangents_by_node.items():
-                if node_id in retained_node_ids:
-                    retained_tangents_by_node[node_id] = packet
+                retain_packet_if_needed(node_id, packet)
         remaining_input_uses = graph.fresh_input_use_counts()
         for record in graph.records:
             record_tangents = _forward_record_tangent_packet(record, tangents_by_node)
@@ -443,13 +499,7 @@ class BackwardRuntimeMixin:
                         parameter,
                         tangent_value,
                     )
-                if (
-                    retained_node_ids is None
-                    or _record_output_node_id(record) in retained_node_ids
-                ):
-                    retained_tangents_by_node[_record_output_node_id(record)] = (
-                        node_tangents
-                    )
+                retain_packet_if_needed(_record_output_node_id(record), node_tangents)
         return retained_tangents_by_node if retained_node_ids is not None else tangents_by_node
 
     def _consume_graph_backward_record(
@@ -744,8 +794,6 @@ class BackwardRuntimeMixin:
         record: ForwardRecord,
         channel: nn.Parameter,
     ) -> bool:
-        if self._has_reused_parameters:
-            return True
         retained_input_node_ids = (
             self._state.same_block_input_tangent_node_ids_by_channel.get(channel)
         )
@@ -760,8 +808,6 @@ class BackwardRuntimeMixin:
         self,
         record: ForwardRecord,
     ) -> bool:
-        if self._has_reused_parameters:
-            return True
         if isinstance(
             record,
             (
@@ -779,8 +825,6 @@ class BackwardRuntimeMixin:
             return True
         if isinstance(record, DivForwardRecord):
             return record.right_node_id is not None
-        if not self._requires_graph_block_scope:
-            return False
         return any(
             self._local_channel_may_cross_record_input(record, channel)
             for channel in self._local_channels_for_parameters(

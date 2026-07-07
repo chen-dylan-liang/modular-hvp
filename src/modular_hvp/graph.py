@@ -38,6 +38,7 @@ class RecordedForwardGraph:
     record_by_output_node: dict[int, ForwardRecord]
     input_use_counts_by_node: dict[int, int]
     retained_forward_tangent_node_ids: frozenset[int]
+    retained_forward_tangent_channels_by_node: dict[int, frozenset[nn.Parameter]]
     requires_hooked_primal_grads: bool
 
     @classmethod
@@ -46,10 +47,36 @@ class RecordedForwardGraph:
         *,
         records: Sequence[ForwardRecord],
         output_node_id: int,
-        retain_local_parameter_inputs: bool = False,
         extra_retained_forward_tangent_node_ids: set[int] | frozenset[int] | None = None,
+        extra_retained_forward_tangent_channels_by_node: Mapping[
+            int,
+            set[nn.Parameter] | frozenset[nn.Parameter],
+        ]
+        | None = None,
     ) -> "RecordedForwardGraph":
         records_tuple = tuple(records)
+        base_retained_node_ids = _graph_forward_tangent_retained_node_ids(
+            records_tuple,
+            output_node_id,
+            extra_retained_node_ids=None,
+        )
+        partial_retained_node_ids = set(
+            extra_retained_forward_tangent_channels_by_node or (),
+        )
+        extra_full_retained_node_ids = set(extra_retained_forward_tangent_node_ids or ())
+        retained_node_ids = (
+            base_retained_node_ids
+            | partial_retained_node_ids
+            | extra_full_retained_node_ids
+        )
+        retained_channels_by_node = {
+            node_id: frozenset(channels)
+            for node_id, channels in (
+                extra_retained_forward_tangent_channels_by_node or {}
+            ).items()
+            if node_id not in base_retained_node_ids
+            and node_id not in extra_full_retained_node_ids
+        }
         return cls(
             records=records_tuple,
             output_node_id=output_node_id,
@@ -58,14 +85,8 @@ class RecordedForwardGraph:
                 _record_output_node_id(record): record for record in records_tuple
             },
             input_use_counts_by_node=_graph_input_use_counts(records_tuple),
-            retained_forward_tangent_node_ids=frozenset(
-                _graph_forward_tangent_retained_node_ids(
-                    records_tuple,
-                    output_node_id,
-                    retain_local_parameter_inputs=retain_local_parameter_inputs,
-                    extra_retained_node_ids=extra_retained_forward_tangent_node_ids,
-                )
-            ),
+            retained_forward_tangent_node_ids=frozenset(retained_node_ids),
+            retained_forward_tangent_channels_by_node=retained_channels_by_node,
             requires_hooked_primal_grads=_graph_requires_primal_backward_grad(
                 records_tuple,
             ),
@@ -273,15 +294,12 @@ def _graph_forward_tangent_retained_node_ids(
     records: Sequence[ForwardRecord],
     output_node_id: int,
     *,
-    retain_local_parameter_inputs: bool,
     extra_retained_node_ids: set[int] | frozenset[int] | None,
 ) -> set[int]:
     retained = {output_node_id}
     if extra_retained_node_ids:
         retained.update(extra_retained_node_ids)
     for record in records:
-        if retain_local_parameter_inputs and _record_local_output_tangents(record):
-            retained.update(_record_input_node_ids(record))
         if isinstance(
             record,
             (

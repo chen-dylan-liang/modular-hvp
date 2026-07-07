@@ -83,9 +83,16 @@ class EagerHVPRuntime(ForwardRuntimeMixin, GraphDispatchMixin, BackwardRuntimeMi
             if len(owners) > 1:
                 self._multi_leaf_block_parameters.update(group)
         self._parameter_use_counts = _parameter_use_counts(model)
-        self._has_reused_parameters = any(
-            count > 1 for count in self._parameter_use_counts.values()
-        )
+        self._reused_parameters = {
+            parameter
+            for parameter, count in self._parameter_use_counts.items()
+            if count > 1
+        }
+        self._reused_block_channels = {
+            self._block_channel_by_parameter[parameter]
+            for parameter in self._reused_parameters
+        }
+        self._has_reused_parameters = bool(self._reused_parameters)
         self._requires_graph_block_scope = _has_multi_leaf_parameter_block(
             model,
             self._block_parameters_by_parameter,
